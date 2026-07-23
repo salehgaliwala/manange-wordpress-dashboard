@@ -1,0 +1,17 @@
+{
+  "name": "central-dashboard",
+  "version": "1.0.0",
+  "description": "Central WordPress Management Dashboard with Automated Safe Update Pipeline.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test-pipeline": "node test-pipeline.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "express": "^4.19.2",
+    "pixelmatch": "^5.3.0",
+    "pngjs": "^7.0.0",
+    "puppeteer": "^22.6.5"
+  }
+}
