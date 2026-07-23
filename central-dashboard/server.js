@@ -9,6 +9,9 @@ const SafeUpdateOrchestrator = require('./orchestrator');
 const app = express();
 app.use(express.json());
 
+// Serve static React dashboard files from the public folder
+app.use(express.static(path.join(__dirname, 'public')));
+
 // Set default port to 3002 as requested
 const PORT = process.env.PORT || 3002;
 
@@ -34,7 +37,7 @@ const SITES_DB = {
     'example-wp-site': {
         url: 'http://localhost:8080',
         secretKey: 'wp_central_shared_secret_key_999',
-        dashboardBaseUrl: 'http://localhost:3002', // Port updated to 3002 consistently
+        dashboardBaseUrl: 'http://localhost:3002',
         s3Config: {
             bucket: 'wp-backups-bucket',
             endpoint: 'https://s3.us-east-1.amazonaws.com',
@@ -66,21 +69,10 @@ function requireAuth(req, res, next) {
 
 /**
  * Endpoint GET /
- * Provides a landing status overview for the Central WordPress Management Dashboard
+ * Serves the beautiful, interactive React/Tailwind landing UI dashboard
  */
 app.get('/', (req, res) => {
-    res.json({
-        status: 'online',
-        service: 'Central WordPress Management System Dashboard',
-        version: '1.2.0',
-        documentation: '/README.md',
-        endpoints: {
-            login: 'POST /api/login',
-            upload_plugin_vault: 'POST /api/plugins/upload (Protected)',
-            plugin_download: 'GET /api/plugins/download/:slug (HMAC signed)',
-            safe_update: 'POST /api/sites/:siteId/safe-update (Protected)'
-        }
-    });
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 /**

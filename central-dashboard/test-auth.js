@@ -21,15 +21,14 @@ async function runAuthTest() {
     const baseUrl = 'http://localhost:3002';
 
     try {
-        // 1. Verify GET / landing route is operational
-        console.log('\nChecking GET / (landing route)...');
+        // 1. Verify GET / landing route serves the React HTML dashboard
+        console.log('\nChecking GET / (landing React dashboard UI)...');
         const landingRes = await axios.get(`${baseUrl}/`);
         console.log('GET / Response status:', landingRes.status);
-        console.log('Response body:', landingRes.data);
-        if (landingRes.status !== 200 || landingRes.data.status !== 'online') {
-            throw new Error('GET / did not return online status!');
+        if (landingRes.status !== 200 || !landingRes.data.includes('<!DOCTYPE html>')) {
+            throw new Error('GET / did not serve correct React landing UI!');
         }
-        console.log('✓ GET / route verification passed.');
+        console.log('✓ GET / React UI served successfully.');
 
         // 2. Verify health check is unprotected
         console.log('\nChecking /health (unprotected)...');
