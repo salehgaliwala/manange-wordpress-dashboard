@@ -16,13 +16,13 @@ class SafeUpdateOrchestrator {
      * @param {string} siteConfig.url Target WordPress site base URL (e.g., 'https://example.com')
      * @param {string} siteConfig.secretKey Shared secret key for HMAC signature
      * @param {Object} siteConfig.s3Config Configuration for WP's S3 backup storage
-     * @param {string} [siteConfig.dashboardBaseUrl] Base URL of the dashboard for pre-signed packages (e.g., 'http://localhost:3000')
+     * @param {string} [siteConfig.dashboardBaseUrl] Base URL of the dashboard for pre-signed packages (e.g., 'http://localhost:3002')
      */
     constructor(siteConfig) {
         this.siteUrl = siteConfig.url.replace(/\/$/, '');
         this.secretKey = siteConfig.secretKey;
         this.s3Config = siteConfig.s3Config;
-        this.dashboardBaseUrl = siteConfig.dashboardBaseUrl || 'http://localhost:3000';
+        this.dashboardBaseUrl = siteConfig.dashboardBaseUrl || 'http://localhost:3002'; // Updated to default to port 3002 consistently
     }
 
     /**
