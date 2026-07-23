@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: WP Central Worker Plugin
- * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups to S3, and automated updates.
- * Version: 1.0.0
+ * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups to S3, automated updates, and custom plugin vault sideloading.
+ * Version: 1.1.1
  * Author: WP Central Team
  * License: GPL2
  */
@@ -314,7 +314,7 @@ class WPCentral_Worker_Controller {
             ), 200);
 
         } elseif ($type === 'plugin') {
-            $plugins = $params['plugins']; // Expects array of plugin files, e.g., ['akismet/akismet.php']
+            $plugins = $params['plugins']; // Array of strings or objects: e.g., [{"file": "akismet/akismet.php", "package_url": "..."}]
             if (empty($plugins) || !is_array($plugins)) {
                 return new WP_REST_Response(array(
                     'status'  => 'error',
@@ -322,13 +322,76 @@ class WPCentral_Worker_Controller {
                 ), 400);
             }
 
+            $standard_upgrades = array();
+            $custom_upgrades_results = array();
+
+            // Initialize Plugin Upgrader with silent automatic skin
             $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
-            $result = $upgrader->bulk_upgrade($plugins);
+
+            foreach ($plugins as $plugin_item) {
+                $plugin_file = '';
+                $package_url = '';
+
+                // Handle both simple formats (string) and custom vault formats (object)
+                if (is_string($plugin_item)) {
+                    $plugin_file = sanitize_text_field($plugin_item);
+                } elseif (is_array($plugin_item)) {
+                    $plugin_file = isset($plugin_item['file']) ? sanitize_text_field($plugin_item['file']) : '';
+                    $package_url = isset($plugin_item['package_url']) ? esc_url_raw($plugin_item['package_url']) : '';
+                }
+
+                if (empty($plugin_file)) {
+                    continue;
+                }
+
+                // If package_url is present, this is a premium/custom plugin sideload!
+                if (!empty($package_url)) {
+                    $download_result = download_url($package_url);
+
+                    if (is_wp_error($download_result)) {
+                        $custom_upgrades_results[$plugin_file] = array(
+                            'status'  => 'error',
+                            'message' => 'Failed to download custom package zip: ' . $download_result->get_error_message()
+                        );
+                        continue;
+                    }
+
+                    // Trigger direct local zip installation/overwrite
+                    $install_result = $upgrader->install($download_result, array('overwrite_package' => true));
+
+                    // Secure local cleanup of temporary download archive
+                    if (file_exists($download_result)) {
+                        @unlink($download_result);
+                    }
+
+                    if (is_wp_error($install_result)) {
+                        $custom_upgrades_results[$plugin_file] = array(
+                            'status'  => 'error',
+                            'message' => $install_result->get_error_message()
+                        );
+                    } else {
+                        $custom_upgrades_results[$plugin_file] = array(
+                            'status'  => 'success',
+                            'message' => 'Sideloaded premium plugin updated successfully.'
+                        );
+                    }
+                } else {
+                    // Standard public WordPress.org repository plugin
+                    $standard_upgrades[] = $plugin_file;
+                }
+            }
+
+            // Run standard public bulk upgrades
+            $standard_results = null;
+            if (!empty($standard_upgrades)) {
+                $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
+            }
 
             return new WP_REST_Response(array(
-                'status'  => 'success',
-                'message' => 'Plugins update completed.',
-                'result'  => $result
+                'status'           => 'success',
+                'message'          => 'Plugins update operation completed.',
+                'custom_results'   => $custom_upgrades_results,
+                'standard_results' => $standard_results
             ), 200);
         }
 

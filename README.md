@@ -4,7 +4,7 @@ A highly secure, robust, and scalable API-based "Worker Plugin" architecture des
 
 The system is composed of two primary components:
 1. **Lightweight WordPress Worker Plugin (`wp-worker-plugin/`)**: An API endpoint provider installed on each target WordPress site.
-2. **Central Dashboard Backend (`central-dashboard/`)**: A Node.js control center coordinating backup, visual regression screenshots, core/plugin updates, and automated rollback actions.
+2. **Central Dashboard Backend (`central-dashboard/`)**: A Node.js control center coordinating backups, visual regression screenshots, core/plugin updates, premium custom plugin vault storage, and automated rollback actions.
 
 ---
 
@@ -23,11 +23,13 @@ The system is composed of two primary components:
 - **Zip Compression**: Archives the whole `/wp-content/` directory recursively. Prevents infinite loops by explicitly excluding the active temporary backup workspace.
 - **AWS Signature V4 REST Client**: Built-in, zero-dependency lightweight S3 client in PHP. Streams and uploads backup archives directly to any S3-compatible cloud storage endpoint (AWS, MinIO, DigitalOcean Spaces, etc.) securely.
 
-### 3. "Safe Update" Pipeline (Dashboard Orchestration)
+### 3. "Safe Update" Pipeline & Premium Plugin Vault (Dashboard Orchestration)
 The central orchestrator automates a zero-downtime, safe update workflow across target sites:
 - **Step A (Remote Backup)**: Triggers the background backup and polls `/job-status` until the S3 upload completes.
 - **Step B (Pre-Screenshot)**: Automates a headless browser (Puppeteer) to snapshot the site's original full-page state.
-- **Step C (Run Update)**: Commands the worker plugin to apply WordPress Core or selected plugin upgrades using native WP administrative Upgrader classes.
+- **Step C (Run Update & Vault Sideload)**:
+  - Commands the worker plugin to apply WordPress Core or selected plugin upgrades using native WP administrative Upgrader classes.
+  - **Premium Vault Sideload**: If updating a custom or premium plugin, the dashboard automatically parses the `.zip` file, extracts metadata headers, registers the slug, signs a secure pre-signed download token, and injects a `package_url` payload. The worker plugin downloads this custom package securely via `download_url()` and overwrites/installs the plugin.
 - **Step D (Post-Screenshot)**: Captures a secondary post-update screenshot of the live site.
 - **Step E (Visual Regression Analysis)**: Compares the pre- and post-screenshots pixel-by-pixel using `pixelmatch`. If the mismatch exceeds **2%**, it logs a high-severity alert, flags the site for manual review, or triggers a rollback.
 
@@ -43,6 +45,7 @@ The central orchestrator automates a zero-downtime, safe update workflow across 
 │   ├── orchestrator.js          # Core Safe Update orchestrator class (Node.js)
 │   ├── server.js                # Protected Express REST server with JWT/Bearer login (Node.js)
 │   ├── test-pipeline.js         # Integration test/mock visual regression runner (Node.js)
+│   ├── test-vault.js            # Premium/Custom Plugin Vault integration test (Node.js)
 │   └── package.json             # Node dependencies and scripts
 └── README.md                    # System documentation
 ```
@@ -109,29 +112,25 @@ Store this token and append it to the HTTP Headers of all protected orchestrator
 Authorization: Bearer <your_token_here>
 ```
 
-### 3. Orchestrating a Safe Update
-Trigger the "Safe Update" pipeline of any registered target site:
-
-- **Endpoint**: `POST /api/sites/:siteId/safe-update`
+### 3. Uploading Premium Plugins to Vault
+To upload a custom or premium plugin `.zip` package:
+- **Endpoint**: `POST /api/plugins/upload`
 - **Headers**:
   ```http
   Authorization: Bearer <your_token_here>
-  Content-Type: application/json
   ```
-- **Request Body**:
-  ```json
-  {
-    "type": "plugin",
-    "plugins": ["akismet/akismet.php"]
-  }
-  ```
+- **Multipart Form-data**: File field `plugin` mapping to your `.zip` archive.
 - **Response**:
   ```json
   {
-    "success": true,
-    "mismatchPercent": 0.00,
-    "preScreenshot": "/app/central-dashboard/screenshot_pre_1784823539.png",
-    "postScreenshot": "/app/central-dashboard/screenshot_post_1784823539.png"
+    "message": "Plugin successfully uploaded, parsed, and vaulted.",
+    "plugin": {
+      "name": "My Premium Plugin",
+      "slug": "my-premium-plugin",
+      "version": "1.2.3",
+      "author": "Awesome Team",
+      "uploadedAt": "2026-07-23T17:25:35.117Z"
+    }
   }
   ```
 
@@ -139,17 +138,16 @@ Trigger the "Safe Update" pipeline of any registered target site:
 
 ## Running Integration & Pipeline Tests
 
-A pre-packaged demonstration suite is included to simulate and test HMAC signature security and Puppeteer visual comparisons end-to-end:
+Two pre-packaged demonstration suites are included to verify security signature logic and custom sideloading flows end-to-end:
 
-1. Navigate to the `central-dashboard/` folder:
-   ```bash
-   cd central-dashboard
-   ```
-2. Execute the test:
-   ```bash
-   npm run test-pipeline
-   ```
-This script will:
-- Verify that standard HMAC-SHA256 signature headers are generated correctly.
-- Generate mock pixel layouts simulating both successful updates (visual difference $\leq$ 2%) and failed visual regression states (difference $>$ 2%).
-- Run pixel-match comparison algorithms over the mock snapshots to verify automated fail-safes.
+### Test Safe Update & Visual Regression Comparison:
+```bash
+cd central-dashboard
+npm run test-pipeline
+```
+
+### Test Premium Plugin Vault, Zip Parsing, and Pre-Signed Sideload download:
+```bash
+cd central-dashboard
+node test-vault.js
+```
