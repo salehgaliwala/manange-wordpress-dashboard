@@ -32,6 +32,7 @@ async function runDemo() {
     const orchestrator = new SafeUpdateOrchestrator({
         url: 'http://localhost:8080',
         secretKey: 'mock_secret_key_123',
+        dashboardBaseUrl: 'http://localhost:3002', // Port updated to 3002 consistently
         s3Config: {
             bucket: 'test-bucket',
             endpoint: 'http://localhost:9000',

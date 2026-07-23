@@ -1,6 +1,6 @@
 /**
  * Authentication & Login Verification Test Script.
- * Verifies that POST /api/login and the protected endpoints respond properly.
+ * Verifies that POST /api/login, GET /, and the protected endpoints respond properly.
  */
 
 const axios = require('axios');
@@ -8,25 +8,35 @@ const http = require('http');
 
 async function runAuthTest() {
     console.log('====================================================');
-    console.log('Running Authentication & Login Flow Test');
+    console.log('Running Authentication, GET /, and Login Flow Test');
     console.log('====================================================');
 
-    // Spin up local Express server on port 3001 for test
-    process.env.PORT = '3001';
+    // Spin up local Express server on port 3002 for test as requested
+    process.env.PORT = '3002';
     const server = require('./server.js');
 
     // Wait a brief moment for Express to initialize
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    const baseUrl = 'http://localhost:3001';
+    const baseUrl = 'http://localhost:3002';
 
     try {
-        // 1. Verify health check is unprotected
+        // 1. Verify GET / landing route is operational
+        console.log('\nChecking GET / (landing route)...');
+        const landingRes = await axios.get(`${baseUrl}/`);
+        console.log('GET / Response status:', landingRes.status);
+        console.log('Response body:', landingRes.data);
+        if (landingRes.status !== 200 || landingRes.data.status !== 'online') {
+            throw new Error('GET / did not return online status!');
+        }
+        console.log('✓ GET / route verification passed.');
+
+        // 2. Verify health check is unprotected
         console.log('\nChecking /health (unprotected)...');
         const healthRes = await axios.get(`${baseUrl}/health`);
         console.log('Health Check Response status:', healthRes.status, healthRes.data);
 
-        // 2. Access protected endpoint without token
+        // 3. Access protected endpoint without token
         console.log('\nAccessing protected endpoint without token...');
         try {
             await axios.post(`${baseUrl}/api/sites/example-wp-site/safe-update`, {
@@ -42,7 +52,7 @@ async function runAuthTest() {
             }
         }
 
-        // 3. Attempt login with invalid credentials
+        // 4. Attempt login with invalid credentials
         console.log('\nAttempting login with invalid credentials...');
         try {
             await axios.post(`${baseUrl}/api/login`, {
@@ -58,7 +68,7 @@ async function runAuthTest() {
             }
         }
 
-        // 4. Attempt login with correct credentials
+        // 5. Attempt login with correct credentials
         console.log('\nAttempting login with correct credentials...');
         const loginRes = await axios.post(`${baseUrl}/api/login`, {
             username: 'admin',
@@ -69,9 +79,8 @@ async function runAuthTest() {
 
         const token = loginRes.data.token;
 
-        // 5. Access protected endpoint with correct token
+        // 6. Access protected endpoint with correct token
         console.log('\nAccessing protected endpoint WITH correct Bearer token (simulated mock)...');
-        // Let's verify that the middleware forwards the request to the orchestrator (which will try to contact mock target)
         try {
             await axios.post(`${baseUrl}/api/sites/example-wp-site/safe-update`, {
                 type: 'plugin',
@@ -92,7 +101,7 @@ async function runAuthTest() {
         }
 
         console.log('\n====================================================');
-        console.log('AUTHENTICATION AND ROUTE PROTECTION VERIFIED SUCCESSFULLY');
+        console.log('AUTHENTICATION, GET /, AND PROTECTION VERIFIED');
         console.log('====================================================');
         process.exit(0);
 
