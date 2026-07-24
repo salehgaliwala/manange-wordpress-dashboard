@@ -1,0 +1,91 @@
+{
+  "admin": {
+    "username": "admin@example.com",
+    "passwordHash": "56d133479cab9bdadda487fedb5e9d059be10ce9a4817ace201ba1e454d140f2"
+  },
+  "tokenSecret": "df061801d368e7b399cf766ea9d99763261a9bb7fbeeb2491b32cc6ef784e12c",
+  "sites": [
+    {
+      "id": "example-wp-site",
+      "name": "Local WP Container",
+      "url": "http://localhost:8080",
+      "secretKey": "wp_central_shared_secret_key_999",
+      "dashboardBaseUrl": "http://localhost:3002",
+      "wpVersion": "6.4.2",
+      "pendingUpdates": 2,
+      "lastBackupStatus": "success",
+      "lastBackupTime": "2 hrs ago",
+      "s3Config": {
+        "bucket": "wp-backups-bucket",
+        "endpoint": "https://s3.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+        "accessKey": "MOCK_S3_ACCESS_KEY",
+        "secretKey": "MOCK_S3_SECRET_KEY"
+      }
+    },
+    {
+      "id": "1",
+      "name": "Alpha Blog",
+      "url": "https://site-alpha.com",
+      "secretKey": "wp_central_shared_secret_key_999",
+      "dashboardBaseUrl": "http://localhost:3002",
+      "wpVersion": "6.4.2",
+      "pendingUpdates": 4,
+      "lastBackupStatus": "success",
+      "lastBackupTime": "2 hrs ago",
+      "s3Config": {
+        "bucket": "wp-backups-bucket",
+        "endpoint": "https://s3.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+        "accessKey": "MOCK_S3_ACCESS_KEY",
+        "secretKey": "MOCK_S3_SECRET_KEY"
+      }
+    },
+    {
+      "id": "2",
+      "name": "Omega Shop",
+      "url": "https://site-omega.com",
+      "secretKey": "wp_central_shared_secret_key_999",
+      "dashboardBaseUrl": "http://localhost:3002",
+      "wpVersion": "6.3.1",
+      "pendingUpdates": 0,
+      "lastBackupStatus": "success",
+      "lastBackupTime": "1 day ago",
+      "s3Config": {
+        "bucket": "wp-backups-bucket",
+        "endpoint": "https://s3.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+        "accessKey": "MOCK_S3_ACCESS_KEY",
+        "secretKey": "MOCK_S3_SECRET_KEY"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Beta Agency",
+      "url": "https://site-beta.com",
+      "secretKey": "wp_central_shared_secret_key_999",
+      "dashboardBaseUrl": "http://localhost:3002",
+      "wpVersion": "6.4.2",
+      "pendingUpdates": 12,
+      "lastBackupStatus": "fail",
+      "lastBackupTime": "3 days ago",
+      "s3Config": {
+        "bucket": "wp-backups-bucket",
+        "endpoint": "https://s3.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+        "accessKey": "MOCK_S3_ACCESS_KEY",
+        "secretKey": "MOCK_S3_SECRET_KEY"
+      }
+    }
+  ],
+  "vault": {
+    "premium-vault-plugin": {
+      "name": "Premium Custom Vault Plugin",
+      "slug": "premium-vault-plugin",
+      "version": "2.1.4",
+      "author": "Vault Development Corp",
+      "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
+      "uploadedAt": "2026-07-24T09:50:15.605Z"
+    }
+  }
+}
