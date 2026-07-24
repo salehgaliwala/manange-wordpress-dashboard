@@ -9,6 +9,12 @@ const SafeUpdateOrchestrator = require('./orchestrator');
 const app = express();
 app.use(express.json());
 
+// Log all incoming requests for easy debugging and diagnostic visibility
+app.use((req, res, next) => {
+    console.log(`[REQUEST] ${req.method} ${req.url}`);
+    next();
+});
+
 // Serve static React dashboard files from the public folder
 app.use(express.static(path.join(__dirname, 'public')));
 
