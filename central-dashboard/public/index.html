@@ -86,10 +86,20 @@
             // Backup destination preference ('s3' or 'local')
             const [backupDest, setBackupDest] = useState('s3');
 
-            // Job queue tracking simulation state
+            // Job queue tracking dynamic state
             const [jobProgress, setJobProgress] = useState(0);
             const [jobStep, setJobStep] = useState('Initializing');
             const [finalBackupPath, setFinalBackupPath] = useState('');
+            const [jobFailed, setJobFailed] = useState(false);
+
+            // Detailed view modal state (Site Detail & Action Center)
+            const [viewingSite, setViewingSite] = useState(null);
+            const [siteUpdatesList, setSiteUpdatesList] = useState(null);
+            const [isLoadingUpdates, setIsLoadingUpdates] = useState(false);
+            const [selectedPluginsToUpdate, setSelectedPluginsToUpdate] = useState(new Set());
+
+            // Polling interval ref
+            const pollerRef = useRef(null);
 
             // Fetch sites from CRUD backend API
             const fetchSites = async () => {
@@ -143,7 +153,8 @@
             }, [sites, searchTerm]);
 
             // Single checkbox toggle
-            const handleToggleRow = (id) => {
+            const handleToggleRow = (id, e) => {
+                e.stopPropagation(); // Avoid triggering Row Detail view click
                 const next = new Set(selectedSiteIds);
                 if (next.has(id)) {
                     next.delete(id);
@@ -163,7 +174,6 @@
             };
 
             const isAllSelected = filteredSites.length > 0 && selectedSiteIds.size === filteredSites.length;
-            const isSomeSelected = selectedSiteIds.size > 0 && selectedSiteIds.size < filteredSites.length;
 
             /**
              * Authenticates admin using email and password
@@ -173,7 +183,6 @@
                 setLoginError(null);
                 setIsLoggingIn(true);
 
-                // Simple client side email format check
                 if (!loginEmail.includes('@') || !loginEmail.includes('.')) {
                     setLoginError('Please enter a valid administrative email address.');
                     setIsLoggingIn(false);
@@ -193,7 +202,6 @@
                     const data = await response.json();
 
                     if (response.ok && data.token) {
-                        // Secure session cookies are set directly by the Express response headers in server.js
                         document.cookie = `wp_central_session=${data.token}; max-age=2592000; path=/; SameSite=Strict`;
                         setIsAuthenticated(true);
                         setTimeout(() => {
@@ -231,7 +239,8 @@
             };
 
             // Dynamic site deletion
-            const handleDeleteSite = async (id) => {
+            const handleDeleteSite = async (id, e) => {
+                if (e) e.stopPropagation();
                 if (!confirm('Are you sure you want to disconnect this WordPress node?')) return;
                 try {
                     const response = await fetch(`/api/sites/${id}`, {
@@ -249,7 +258,8 @@
             };
 
             // Dynamic site sync
-            const handleSyncSite = async (id) => {
+            const handleSyncSite = async (id, e) => {
+                if (e) e.stopPropagation();
                 try {
                     const response = await fetch(`/api/sites/${id}/sync`, {
                         method: 'POST'
@@ -331,50 +341,111 @@
                 }, 1800);
             };
 
-            // Automated Direct Update Pipeline (Pre-update backup + direct core/plugin updates)
-            const triggerDirectUpdate = async (site) => {
-                setActiveJobId('job_' + Date.now());
-                setJobProgress(0);
-                setJobStep('Initializing Pipeline Connection...');
-
-                const backupPath = backupDest === 's3'
-                    ? `S3 Cloud Storage Bucket: ${site.s3Config ? site.s3Config.bucket : 'wp-backups-bucket'}`
-                    : `Local Disk Folder: wp-content/uploads/wp-central-backups/backup_${site.id}.zip`;
-
-                setFinalBackupPath(backupPath);
-
-                let progress = 0;
-                const interval = setInterval(() => {
-                    progress += 10;
-                    setJobProgress(progress);
-
-                    if (progress < 25) setJobStep(`Triggering target backup execution on target...`);
-                    else if (progress < 50) setJobStep(`Exporting databases and archiving entire /wp-content/ directory...`);
-                    else if (progress < 75) setJobStep(`Securing archive to final destination: ${backupPath}`);
-                    else if (progress < 95) setJobStep(`Dispatching direct Core / Plugin update upgrader routines...`);
-                    else setJobStep(`✓ Pipeline complete! Node updated directly and safely.`);
-
-                    if (progress >= 100) {
-                        clearInterval(interval);
-                        // Refresh status values
-                        fetchSites();
-                    }
-                }, 450);
+            // Open Site Detail & Action Center
+            const openSiteDetails = async (site) => {
+                setViewingSite(site);
+                setIsLoadingUpdates(true);
+                setSiteUpdatesList(null);
+                setSelectedPluginsToUpdate(new Set());
 
                 try {
-                    // Send actual request to trigger S3/local updates
-                    await fetch(`/api/sites/${site.id}/safe-update`, {
+                    const res = await fetch(`/api/sites/${site.id}/updates-list`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        setSiteUpdatesList(data);
+
+                        // Select all pending plugins by default
+                        const initialSelected = new Set(data.pending_plugins.map(p => p.file));
+                        setSelectedPluginsToUpdate(initialSelected);
+                    }
+                } catch (err) {
+                    console.error('Failed to load pending updates list:', err);
+                } finally {
+                    setIsLoadingUpdates(false);
+                }
+            };
+
+            // Start Real-Time Job Progress Polling on backend
+            const startPollingJob = (jobId) => {
+                if (pollerRef.current) clearInterval(pollerRef.current);
+                setJobFailed(false);
+
+                pollerRef.current = setInterval(async () => {
+                    try {
+                        const res = await fetch(`/api/jobs/${jobId}`);
+                        if (res.ok) {
+                            const job = await res.json();
+                            setJobProgress(job.progress);
+                            setJobStep(job.step);
+
+                            if (job.status === 'completed') {
+                                clearInterval(pollerRef.current);
+                                setFinalBackupPath(job.backup_path || 'S3 Cloud Storage Bucket');
+                                fetchSites(); // Sync main dashboard stats
+                            } else if (job.status === 'failed') {
+                                clearInterval(pollerRef.current);
+                                setJobFailed(true);
+                                fetchSites();
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Error polling active job:', err);
+                    }
+                }, 2000);
+            };
+
+            // Cleanup poller on unmount
+            useEffect(() => {
+                return () => {
+                    if (pollerRef.current) clearInterval(pollerRef.current);
+                };
+            }, []);
+
+            // Automated Safe Update Pipeline Execution
+            const triggerSafeUpdatePipeline = async (type, specifiedPlugins = []) => {
+                if (!viewingSite) return;
+
+                setViewingSite(null); // Close detail pane
+                setActiveJobId('initializing...');
+                setJobProgress(10);
+                setJobStep('Contacting orchestrator backend...');
+
+                try {
+                    const res = await fetch(`/api/sites/${viewingSite.id}/safe-update`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            type: site.pendingUpdates > 0 ? 'plugin' : 'core',
-                            plugins: ['akismet/akismet.php'],
+                            type: type,
+                            plugins: specifiedPlugins,
                             backup_destination: backupDest
                         })
                     });
-                } catch (e) {
-                    console.warn('Network connection mocked fallback.');
+
+                    if (res.status === 202) {
+                        const data = await res.json();
+                        setActiveJobId(data.job_id);
+                        // Launch active progress poller
+                        startPollingJob(data.job_id);
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to start safe update pipeline.');
+                        setActiveJobId(null);
+                    }
+                } catch (err) {
+                    alert('Network error executing update pipeline.');
+                    setActiveJobId(null);
                 }
+            };
+
+            // Toggle single plugin checkbox in action center
+            const handleTogglePluginCheck = (file) => {
+                const next = new Set(selectedPluginsToUpdate);
+                if (next.has(file)) {
+                    next.delete(file);
+                } else {
+                    next.add(file);
+                }
+                setSelectedPluginsToUpdate(next);
             };
 
             // RENDER LOGIN SCREEN GATES IF NOT AUTHENTICATED
@@ -535,22 +606,27 @@
                             </div>
                         </div>
 
-                        {/* Direct Update Progress bar indicator */}
+                        {/* Direct Update Progress bar indicator - REAL TIME POLLED FROM BACKEND */}
                         {activeJobId && (
                             <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-4 animate-fadeIn">
                                 <div className="flex justify-between items-center">
                                     <div>
                                         <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                                            <span className="flex h-2 w-2 relative">
-                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-                                                <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-                                            </span>
-                                            Automated Update Pipeline Progress
+                                            {!jobFailed && jobProgress < 100 ? (
+                                                <span className="flex h-2 w-2 relative">
+                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+                                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
+                                                </span>
+                                            ) : null}
+                                            {jobFailed ? '⚠️ Automated Update Pipeline Failed' : 'Automated Update Pipeline Progress'}
                                         </h3>
                                         <p className="text-xs text-slate-400 font-mono mt-0.5">Job ID: {activeJobId}</p>
                                     </div>
                                     <button
-                                        onClick={() => setActiveJobId(null)}
+                                        onClick={() => {
+                                            setActiveJobId(null);
+                                            setJobFailed(false);
+                                        }}
                                         className="text-xs text-slate-500 hover:text-white bg-slate-950 px-2.5 py-1 border border-slate-800 rounded-md"
                                     >
                                         Dismiss
@@ -559,27 +635,29 @@
 
                                 <div className="space-y-2">
                                     <div className="flex justify-between items-center text-xs font-semibold">
-                                        <span className="text-violet-400">{jobStep}</span>
+                                        <span className={jobFailed ? 'text-rose-400' : 'text-violet-400'}>{jobStep}</span>
                                         <span className="text-slate-300 font-mono text-sm font-bold">{jobProgress}%</span>
                                     </div>
                                     <div className="w-full bg-slate-950 rounded-full h-3 border border-slate-800 overflow-hidden p-0.5">
                                         <div
-                                            className="bg-gradient-to-r from-violet-600 to-indigo-500 h-full rounded-full transition-all duration-500"
+                                            className={`h-full rounded-full transition-all duration-500 ${
+                                                jobFailed ? 'bg-rose-600' : 'bg-gradient-to-r from-violet-600 to-indigo-500'
+                                            }`}
                                             style={{ width: `${jobProgress}%` }}
                                         />
                                     </div>
                                 </div>
 
-                                {jobProgress >= 100 && (
+                                {jobProgress >= 100 && !jobFailed && (
                                     <div className="pt-4 border-t border-slate-800">
                                         <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
                                             <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
                                             <p className="text-xs text-slate-300">
                                                 WordPress core and plugin packages have been safely updated directly on the worker. The previous system files and database were archived and secure.
                                             </p>
-                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-2 rounded border border-slate-850">
-                                                <span className="text-slate-500">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump<br/>
-                                                <span className="text-slate-500">Backup Storage Path:</span> {finalBackupPath}
+                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
+                                                <span className="text-slate-500 font-semibold">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump (Skip non-readable files: Enabled)<br/>
+                                                <span className="text-slate-500 font-semibold">Backup Storage Destination:</span> {finalBackupPath}
                                             </div>
                                         </div>
                                     </div>
@@ -595,7 +673,7 @@
                                         <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
                                         Connected WordPress Sites ({sites.length})
                                     </h2>
-                                    <p className="text-sm text-slate-400 mt-1">Manage core/plugin updates and secure backup nodes concurrently.</p>
+                                    <p className="text-sm text-slate-400 mt-1">Click on a site row to access the <strong>Site Detail & Action Center</strong> for granular updates.</p>
                                 </div>
 
                                 <div className="flex flex-wrap items-center gap-3">
@@ -654,7 +732,7 @@
                                             <th className="py-4 px-4">Site URL</th>
                                             <th className="py-4 px-4">WP Version</th>
                                             <th className="py-4 px-4">Pending Updates</th>
-                                            <th className="py-4 px-4">Last S3 Backup Status</th>
+                                            <th className="py-4 px-4">Last Backup Status</th>
                                             <th className="py-4 px-4 text-right">Actions</th>
                                         </tr>
                                     </thead>
@@ -662,16 +740,23 @@
                                         {filteredSites.map((site) => {
                                             const isSelected = selectedSiteIds.has(site.id);
                                             return (
-                                                <tr key={site.id} className={`transition hover:bg-slate-800/40 ${isSelected ? 'bg-violet-950/10' : ''}`}>
+                                                <tr
+                                                    key={site.id}
+                                                    onClick={() => openSiteDetails(site)}
+                                                    className={`transition hover:bg-slate-850/60 cursor-pointer ${isSelected ? 'bg-violet-950/10' : ''}`}
+                                                >
                                                     <td className="py-4 px-4 text-center">
                                                         <input
                                                             type="checkbox"
                                                             checked={isSelected}
-                                                            onChange={() => handleToggleRow(site.id)}
+                                                            onChange={(e) => handleToggleRow(site.id, e)}
                                                             className="rounded border-slate-800 text-violet-600 bg-slate-950 focus:ring-0 focus:ring-offset-0 cursor-pointer w-4 h-4"
                                                         />
                                                     </td>
-                                                    <td className="py-4 px-4 font-bold text-white">{site.name}</td>
+                                                    <td className="py-4 px-4 font-bold text-white flex items-center gap-2">
+                                                        <span className="text-violet-400">🌐</span>
+                                                        {site.name}
+                                                    </td>
                                                     <td className="py-4 px-4 text-slate-400 font-mono text-xs">{site.url}</td>
                                                     <td className="py-4 px-4 font-semibold text-slate-300">
                                                         <span className="bg-slate-950 px-2.5 py-1.5 rounded-md border border-slate-850">
@@ -693,7 +778,7 @@
                                                     <td className="py-4 px-4 text-xs">
                                                         {site.lastBackupStatus === 'success' ? (
                                                             <div className="flex flex-col gap-0.5">
-                                                                <span className="text-slate-400 font-medium">{site.lastBackupTime.includes('Just') ? 'Local Disk Secured' : 'S3 Secured'}</span>
+                                                                <span className="text-slate-300 font-semibold">{site.lastBackupTime.includes('now') ? 'Disk / S3' : 'S3 Cloud'}</span>
                                                                 <span className="text-[10px] text-slate-500 font-mono">{site.lastBackupTime}</span>
                                                             </div>
                                                         ) : (
@@ -703,28 +788,22 @@
                                                     <td className="py-4 px-4 text-right">
                                                         <div className="flex items-center justify-end gap-2">
                                                             <button
-                                                                onClick={() => triggerDirectUpdate(site)}
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    openSiteDetails(site);
+                                                                }}
                                                                 className="bg-violet-600/10 hover:bg-violet-600 border border-violet-500/20 text-violet-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
                                                             >
-                                                                Update
+                                                                Open Details
                                                             </button>
                                                             <button
-                                                                onClick={() => handleSyncSite(site.id)}
+                                                                onClick={(e) => handleSyncSite(site.id, e)}
                                                                 className="bg-sky-600/10 hover:bg-sky-600 border border-sky-500/20 text-sky-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
                                                             >
                                                                 🔄 Sync
                                                             </button>
                                                             <button
-                                                                onClick={() => {
-                                                                    alert(`Backup triggered to ${backupDest.toUpperCase()} for: ${site.name}`);
-                                                                    setSites(sites.map(s => s.id === site.id ? { ...s, lastBackupStatus: 'success', lastBackupTime: 'Just now' } : s));
-                                                                }}
-                                                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
-                                                            >
-                                                                Backup ({backupDest === 's3' ? 'S3' : 'Local'})
-                                                            </button>
-                                                            <button
-                                                                onClick={() => handleDeleteSite(site.id)}
+                                                                onClick={(e) => handleDeleteSite(site.id, e)}
                                                                 className="bg-rose-950/20 hover:bg-rose-900 border border-rose-850/20 text-rose-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
                                                             >
                                                                 Delete
@@ -825,6 +904,135 @@
 
                         </div>
                     </main>
+
+                    {/* Site Detail & Action Center Drawer/Modal */}
+                    {viewingSite && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-end z-50 animate-fadeIn">
+                            <div className="bg-slate-900 border-l border-slate-800 h-full w-full max-w-xl p-6 flex flex-col justify-between shadow-2xl">
+                                <div className="space-y-6 overflow-y-auto pr-2">
+                                    <div className="flex justify-between items-start border-b border-slate-800 pb-4">
+                                        <div>
+                                            <span className="text-[10px] bg-violet-600/25 border border-violet-500/20 text-violet-300 px-2.5 py-1.5 rounded-full font-mono uppercase font-bold tracking-widest block w-max mb-1.5">
+                                                Site Detail & Action Center
+                                            </span>
+                                            <h3 className="text-xl font-bold text-white">{viewingSite.name}</h3>
+                                            <a href={viewingSite.url} target="_blank" className="text-xs text-slate-400 hover:text-violet-400 font-mono flex items-center gap-1.5 mt-1">
+                                                {viewingSite.url} ↗
+                                            </a>
+                                        </div>
+                                        <button
+                                            onClick={() => setViewingSite(null)}
+                                            className="text-slate-400 hover:text-white font-bold text-lg bg-slate-950 p-2 rounded-lg border border-slate-850"
+                                        >
+                                            ✕ Close
+                                        </button>
+                                    </div>
+
+                                    {/* System Details */}
+                                    <div className="grid grid-cols-2 gap-4 bg-slate-950 p-4 rounded-xl border border-slate-850 text-xs">
+                                        <div>
+                                            <span className="text-slate-500 block">WordPress Core Version</span>
+                                            <span className="text-sm font-bold text-white">v{viewingSite.wpVersion}</span>
+                                        </div>
+                                        <div>
+                                            <span className="text-slate-500 block">Shared Secret Key</span>
+                                            <span className="text-sm font-bold text-slate-400 font-mono">HMAC Sha-256 Enabled</span>
+                                        </div>
+                                        <div className="col-span-2 pt-2 border-t border-slate-850">
+                                            <span className="text-slate-500 block">S3 Bucket Storage Node</span>
+                                            <span className="text-sm font-semibold text-slate-300">{viewingSite.s3Config ? viewingSite.s3Config.bucket : 'N/A'}</span>
+                                        </div>
+                                    </div>
+
+                                    {/* Granular Pending Updates - DYNAMICALLY LOADED */}
+                                    <div>
+                                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Pending Updates Package Manager</h4>
+                                        {isLoadingUpdates ? (
+                                            <div className="p-8 text-center space-y-3 bg-slate-950 rounded-xl border border-slate-850">
+                                                <span className="w-5 h-5 rounded-full border-2 border-violet-500 border-t-transparent animate-spin inline-block"></span>
+                                                <p className="text-xs text-slate-400">Querying worker plugin updates cache...</p>
+                                            </div>
+                                        ) : siteUpdatesList ? (
+                                            <div className="space-y-4">
+                                                {/* Core updates */}
+                                                {siteUpdatesList.pending_core ? (
+                                                    <div className="bg-amber-950/10 border border-amber-900/50 p-4 rounded-xl flex items-center justify-between">
+                                                        <div>
+                                                            <span className="text-xs font-bold text-amber-400">WordPress Core upgrade available</span>
+                                                            <p className="text-[11px] text-slate-300">Upgrade core directly. Safe pipeline executes pre-update backup automatically.</p>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => triggerSafeUpdatePipeline('core')}
+                                                            className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3.5 py-2 rounded-lg transition"
+                                                        >
+                                                            Update Core
+                                                        </button>
+                                                    </div>
+                                                ) : (
+                                                    <div className="bg-slate-950 p-3 rounded-lg border border-slate-850 text-xs text-emerald-400 font-bold flex items-center gap-2">
+                                                        <span>✓</span> WordPress Core is fully up-to-date
+                                                    </div>
+                                                )}
+
+                                                {/* Plugin updates checkboxes */}
+                                                <div className="space-y-2">
+                                                    <span className="text-[11px] text-slate-500 font-bold block">Available Plugin Upgrades ({siteUpdatesList.pending_plugins.length})</span>
+                                                    {siteUpdatesList.pending_plugins.length > 0 ? (
+                                                        <div className="space-y-2 max-h-48 overflow-y-auto">
+                                                            {siteUpdatesList.pending_plugins.map((plugin) => {
+                                                                const isChecked = selectedPluginsToUpdate.has(plugin.file);
+                                                                return (
+                                                                    <label
+                                                                        key={plugin.file}
+                                                                        className="flex items-center justify-between p-3 rounded-lg bg-slate-950 border border-slate-850 hover:bg-slate-900 cursor-pointer text-xs"
+                                                                    >
+                                                                        <div className="flex items-center gap-3">
+                                                                            <input
+                                                                                type="checkbox"
+                                                                                checked={isChecked}
+                                                                                onChange={() => handleTogglePluginCheck(plugin.file)}
+                                                                                className="rounded border-slate-800 text-violet-600 bg-slate-950 focus:ring-0 focus:ring-offset-0 cursor-pointer w-4.5 h-4.5"
+                                                                            />
+                                                                            <div>
+                                                                                <span className="font-bold text-white block">{plugin.name}</span>
+                                                                                <span className="text-[10px] text-slate-500 font-mono">{plugin.file}</span>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="text-right">
+                                                                            <span className="text-slate-400 font-semibold block">v{plugin.new_version}</span>
+                                                                            <span className="text-[9px] text-slate-600">Current: v{plugin.current_version}</span>
+                                                                        </div>
+                                                                    </label>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-xs text-slate-500 italic bg-slate-950 p-4 rounded-xl text-center">No plugin updates pending on target site.</p>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <p className="text-xs text-slate-500 bg-slate-950 p-4 rounded-xl text-center">Failed to fetch updates list. Connect worker and check system settings.</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="pt-4 border-t border-slate-800 space-y-3">
+                                    <div className="flex justify-between items-center text-xs">
+                                        <span className="text-slate-400 font-semibold">Active Destination:</span>
+                                        <span className="font-mono text-violet-400 font-bold uppercase">{backupDest} Mode</span>
+                                    </div>
+                                    <button
+                                        disabled={selectedPluginsToUpdate.size === 0 || isLoadingUpdates}
+                                        onClick={() => triggerSafeUpdatePipeline('plugin', Array.from(selectedPluginsToUpdate))}
+                                        className="w-full bg-violet-600 hover:bg-violet-700 text-white font-bold py-3 rounded-xl text-sm transition disabled:opacity-40 shadow-md shadow-violet-500/10"
+                                    >
+                                        Trigger Safe Update Pipeline ({selectedPluginsToUpdate.size} Plugin{selectedPluginsToUpdate.size !== 1 ? 's' : ''})
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Change Password Modal */}
                     {isChangingPassword && (
