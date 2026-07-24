@@ -52,16 +52,31 @@ const VAULT_DB = {};
 
 /**
  * Authentication Middleware
+ * Supports validating both Bearer authorization headers and HTTP cookie sessions.
  */
 function requireAuth(req, res, next) {
+    let token = null;
+
+    // 1. Extract from Authorization header
     const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Access Denied. No authorization header or Bearer token provided.' });
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
     }
 
-    const token = authHeader.split(' ')[1];
-    if (!ACTIVE_TOKENS.has(token)) {
-        return res.status(403).json({ error: 'Invalid or expired authentication token.' });
+    // 2. Extract from cookies if header was not provided
+    if (!token && req.headers.cookie) {
+        const cookies = {};
+        req.headers.cookie.split(';').forEach(cookie => {
+            const parts = cookie.split('=');
+            if (parts.length >= 2) {
+                cookies[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('='));
+            }
+        });
+        token = cookies['wp_central_session'];
+    }
+
+    if (!token || !ACTIVE_TOKENS.has(token)) {
+        return res.status(401).json({ error: 'Access Denied. Please sign in with admin credentials.' });
     }
 
     next();
@@ -78,6 +93,7 @@ app.get('/', (req, res) => {
 /**
  * Endpoint to login and receive a session token
  * POST /api/login
+ * Sets a 30-day cookie wp_central_session
  */
 app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
@@ -86,14 +102,24 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ error: 'Username and password are required.' });
     }
 
+    console.log('[DEBUG LOGIN] Received username:', username, 'password:', password);
+    console.log('[DEBUG LOGIN] Expected username:', ADMIN_CREDENTIALS.username, 'expected hash:', ADMIN_CREDENTIALS.passwordHash);
+
+    // Accept administrative login (any matching admin email format or username)
+    const isMatchingUsername = username === ADMIN_CREDENTIALS.username || username.split('@')[0] === ADMIN_CREDENTIALS.username;
     const inputHash = crypto.createHash('sha256').update(password).digest('hex');
 
-    if (username === ADMIN_CREDENTIALS.username && inputHash === ADMIN_CREDENTIALS.passwordHash) {
+    console.log('[DEBUG LOGIN] user match:', isMatchingUsername, 'pass match:', inputHash === ADMIN_CREDENTIALS.passwordHash);
+
+    if (isMatchingUsername && inputHash === ADMIN_CREDENTIALS.passwordHash) {
         const tokenPayload = `${username}:${Date.now()}`;
         const signature = crypto.createHmac('sha256', TOKEN_SECRET).update(tokenPayload).digest('hex');
         const token = Buffer.from(`${tokenPayload}.${signature}`).toString('base64');
 
         ACTIVE_TOKENS.add(token);
+
+        // Set secure session cookie valid for 30 days (2592000 seconds)
+        res.setHeader('Set-Cookie', `wp_central_session=${token}; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict`);
 
         return res.status(200).json({
             message: 'Authentication successful.',
@@ -156,6 +182,9 @@ app.post('/api/plugins/upload', requireAuth, upload.single('plugin'), (req, res)
 
         if (!detectedSlug) {
             detectedSlug = pluginName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+        } else {
+            // Aggressively sanitize slug to prevent path traversal or other malicious file injection
+            detectedSlug = detectedSlug.replace(/[^a-z0-9_-]+/gi, '-').toLowerCase();
         }
 
         // Securely store the zip using the slug as file name
@@ -259,7 +288,7 @@ app.get('/api/plugins/download/:slug', (req, res) => {
  */
 app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const { siteId } = req.params;
-    const { type, plugins } = req.body;
+    const { type, plugins, backup_destination } = req.body;
 
     const site = SITES_DB[siteId];
     if (!site) {
@@ -273,7 +302,8 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const orchestrator = new SafeUpdateOrchestrator(site);
 
     try {
-        const result = await orchestrator.executeSafeUpdate({ type, plugins });
+        const destination = backup_destination || 's3';
+        const result = await orchestrator.executeSafeUpdate({ type, plugins, backup_destination: destination });
         return res.status(200).json(result);
     } catch (err) {
         return res.status(500).json({
