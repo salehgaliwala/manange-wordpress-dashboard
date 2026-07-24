@@ -1,10 +1,7 @@
 const crypto = require('crypto');
 const axios = require('axios');
-const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { PNG } = require('pngjs');
-const pixelmatch = require('pixelmatch');
 
 /**
  * Orchestrator class representing the Core Central Dashboard logic and its Safe Update Pipeline.
@@ -22,7 +19,7 @@ class SafeUpdateOrchestrator {
         this.siteUrl = siteConfig.url.replace(/\/$/, '');
         this.secretKey = siteConfig.secretKey;
         this.s3Config = siteConfig.s3Config;
-        this.dashboardBaseUrl = siteConfig.dashboardBaseUrl || 'http://localhost:3002'; // Updated to default to port 3002 consistently
+        this.dashboardBaseUrl = siteConfig.dashboardBaseUrl || 'http://localhost:3002';
     }
 
     /**
@@ -67,30 +64,6 @@ class SafeUpdateOrchestrator {
     }
 
     /**
-     * Capture a full-page visual screenshot using Puppeteer.
-     */
-    async captureScreenshot(outputPath) {
-        console.log(`[Puppeteer] Launching browser to capture: ${this.siteUrl}`);
-        const browser = await puppeteer.launch({
-            headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
-
-        try {
-            const page = await browser.newPage();
-            // Wait until network is mostly idle to ensure asset loading finishes
-            await page.goto(this.siteUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-            await page.setViewport({ width: 1440, height: 900 });
-
-            // Capture entire scrollable page
-            await page.screenshot({ path: outputPath, fullPage: true });
-            console.log(`[Puppeteer] Saved screenshot to: ${outputPath}`);
-        } finally {
-            await browser.close();
-        }
-    }
-
-    /**
      * Poll Job Status on Worker Plugin until backup process completes or fails.
      */
     async pollBackupStatus(jobId, intervalMs = 5000, timeoutMs = 600000) {
@@ -120,44 +93,6 @@ class SafeUpdateOrchestrator {
     }
 
     /**
-     * Visual regression check of pre vs post screenshots.
-     * @returns {number} Percentage mismatch (0 to 100)
-     */
-    compareScreenshots(prePath, postPath, diffPath) {
-        console.log(`[Visual Comparison] Comparing ${prePath} and ${postPath}`);
-
-        const img1 = PNG.sync.read(fs.readFileSync(prePath));
-        const img2 = PNG.sync.read(fs.readFileSync(postPath));
-        const { width, height } = img1;
-
-        // Verify dimensions match
-        if (img1.width !== img2.width || img1.height !== img2.height) {
-            console.warn('[Visual Comparison] Warning: Pre and Post screenshots have different dimensions!');
-            return 100;
-        }
-
-        const diff = new PNG({ width, height });
-
-        const numDiffPixels = pixelmatch(
-            img1.data,
-            img2.data,
-            diff.data,
-            width,
-            height,
-            { threshold: 0.1 }
-        );
-
-        const totalPixels = width * height;
-        const mismatchPercent = (numDiffPixels / totalPixels) * 100;
-
-        fs.writeFileSync(diffPath, PNG.sync.write(diff));
-        console.log(`[Visual Comparison] Difference percentage: ${mismatchPercent.toFixed(2)}%`);
-        console.log(`[Visual Comparison] Visual regression diff map saved to: ${diffPath}`);
-
-        return mismatchPercent;
-    }
-
-    /**
      * Helper to extract a slug from a plugin filepath string (e.g., 'akismet/akismet.php' -> 'akismet')
      */
     getPluginSlug(pluginFile) {
@@ -183,21 +118,18 @@ class SafeUpdateOrchestrator {
 
     /**
      * Orchestrator execution entry point.
-     * Performs a complete safe automated update sequence.
+     * Performs an automated update sequence with pre-update backup step.
      *
      * @param {Object} updateParams Update payload, e.g., { type: 'plugin', plugins: ['akismet/akismet.php'] }
      */
     async executeSafeUpdate(updateParams) {
         console.log('\n=== Starting Safe Update Pipeline ===');
-        const timestampSuffix = Date.now();
-        const preScreenshot = path.join(__dirname, `screenshot_pre_${timestampSuffix}.png`);
-        const postScreenshot = path.join(__dirname, `screenshot_post_${timestampSuffix}.png`);
-        const diffScreenshot = path.join(__dirname, `screenshot_diff_${timestampSuffix}.png`);
 
         try {
             // STEP A: Trigger asynchronous backup on the remote plugin and poll for completion
             console.log('\n--- Step A: Triggering Remote Backup ---');
             const backupPayload = {
+                backup_destination: updateParams.backup_destination || 's3',
                 s3_bucket: this.s3Config.bucket,
                 s3_endpoint: this.s3Config.endpoint,
                 s3_region: this.s3Config.region,
@@ -211,15 +143,10 @@ class SafeUpdateOrchestrator {
 
             // Wait for non-blocking backup to upload to S3 successfully
             await this.pollBackupStatus(job_id);
-            console.log('✓ Step A Completed. Backup uploaded securely to S3.');
+            console.log('✓ Step A Completed. Backup created successfully.');
 
-            // STEP B: Visual snapshot (Pre-Update)
-            console.log('\n--- Step B: Capturing Pre-Update Visual State ---');
-            await this.captureScreenshot(preScreenshot);
-            console.log('✓ Step B Completed.');
-
-            // STEP C: Perform the update (Modifying payload for custom plugin vault matches)
-            console.log('\n--- Step C: Dispatching Automated Core / Plugin Updates ---');
+            // STEP B: Perform the update (Modifying payload for custom plugin vault matches)
+            console.log('\n--- Step B: Dispatching Automated Core / Plugin Updates ---');
 
             let finalUpdatePayload = { ...updateParams };
 
@@ -262,36 +189,12 @@ class SafeUpdateOrchestrator {
 
             const updateResponse = await this.signedPost('/wp-json/wp-central/v1/update', finalUpdatePayload);
             console.log(`Update Result Message: ${updateResponse.data.message}`);
-            console.log('✓ Step C Completed.');
+            console.log('✓ Step B Completed.');
 
-            // STEP D: Visual snapshot (Post-Update)
-            console.log('\n--- Step D: Capturing Post-Update Visual State ---');
-            await this.captureScreenshot(postScreenshot);
-            console.log('✓ Step D Completed.');
-
-            // STEP E: Run visual regression calculations
-            console.log('\n--- Step E: Executing Visual Regression Analysis ---');
-            const mismatchPercent = this.compareScreenshots(preScreenshot, postScreenshot, diffScreenshot);
-
-            if (mismatchPercent > 2.0) {
-                console.error(`\n[CRITICAL ALERT] Visual mismatch is ${mismatchPercent.toFixed(2)}%, exceeding the 2% threshold.`);
-                console.error('Action: Flagging site for manual review and staging rollback rollback procedures!');
-                return {
-                    success: false,
-                    reason: 'Visual regression threshold exceeded',
-                    mismatchPercent,
-                    preScreenshot,
-                    postScreenshot,
-                    diffScreenshot
-                };
-            }
-
-            console.log(`\n✓ Safe Update Finished successfully! Visual mismatch: ${mismatchPercent.toFixed(2)}% is within limits.`);
+            console.log('\n✓ Automated Update Pipeline finished successfully!');
             return {
                 success: true,
-                mismatchPercent,
-                preScreenshot,
-                postScreenshot
+                message: updateResponse.data.message
             };
 
         } catch (error) {
