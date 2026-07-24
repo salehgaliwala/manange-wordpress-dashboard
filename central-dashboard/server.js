@@ -37,44 +37,55 @@ function loadDB() {
     try {
         if (fs.existsSync(DB_PATH)) {
             const content = fs.readFileSync(DB_PATH, 'utf8');
-            return JSON.parse(content);
+            if (content && content.trim()) {
+                return JSON.parse(content);
+            }
         }
     } catch (err) {
         console.error('[DB Error] Failed to load JSON database:', err);
     }
-    // Fallback default structure
-    const fallback = {
-        admin: {
-            username: process.env.DASHBOARD_ADMIN_USER || 'admin@example.com',
-            passwordHash: crypto.createHash('sha256').update(process.env.DASHBOARD_ADMIN_PASS || 'SecurePassword123').digest('hex')
-        },
-        tokenSecret: crypto.randomBytes(32).toString('hex'),
-        sites: [
-            {
-                id: 'example-wp-site',
-                name: 'Local WP Container',
-                url: 'http://localhost:8080',
-                secretKey: 'wp_central_shared_secret_key_999',
-                dashboardBaseUrl: 'http://localhost:3002',
-                wpVersion: '6.4.2',
-                pendingUpdates: 2,
-                lastBackupStatus: 'success',
-                lastBackupTime: '2 hrs ago',
-                s3Config: {
-                    bucket: 'wp-backups-bucket',
-                    endpoint: 'https://s3.us-east-1.amazonaws.com',
-                    region: 'us-east-1',
-                    accessKey: 'MOCK_S3_ACCESS_KEY',
-                    secretKey: 'MOCK_S3_SECRET_KEY'
+
+    // Only generate fallback and write to disk if the file DOES NOT exist at all
+    if (!fs.existsSync(DB_PATH)) {
+        const fallback = {
+            admin: {
+                username: process.env.DASHBOARD_ADMIN_USER || 'admin@example.com',
+                passwordHash: crypto.createHash('sha256').update(process.env.DASHBOARD_ADMIN_PASS || 'SecurePassword123').digest('hex')
+            },
+            tokenSecret: crypto.randomBytes(32).toString('hex'),
+            sites: [
+                {
+                    id: 'example-wp-site',
+                    name: 'Local WP Container',
+                    url: 'http://localhost:8080',
+                    secretKey: 'wp_central_shared_secret_key_999',
+                    dashboardBaseUrl: 'http://localhost:3002',
+                    wpVersion: '6.4.2',
+                    pendingUpdates: 2,
+                    lastBackupStatus: 'success',
+                    lastBackupTime: '2 hrs ago',
+                    s3Config: {
+                        bucket: 'wp-backups-bucket',
+                        endpoint: 'https://s3.us-east-1.amazonaws.com',
+                        region: 'us-east-1',
+                        accessKey: 'MOCK_S3_ACCESS_KEY',
+                        secretKey: 'MOCK_S3_SECRET_KEY'
+                    }
                 }
-            }
-        ],
-        vault: {}
-    };
+            ],
+            vault: {}
+        };
+        try {
+            fs.writeFileSync(DB_PATH, JSON.stringify(fallback, null, 2), 'utf8');
+        } catch (e) {}
+        return fallback;
+    }
+
+    // Fallback parser safety check if exists but parsing failed temporarily
     try {
-        fs.writeFileSync(DB_PATH, JSON.stringify(fallback, null, 2), 'utf8');
+        const content = fs.readFileSync(DB_PATH, 'utf8');
+        if (content) return JSON.parse(content);
     } catch (e) {}
-    return fallback;
 }
 
 function saveDB(data) {
