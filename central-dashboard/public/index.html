@@ -52,12 +52,17 @@
             const [loginError, setLoginError] = useState(null);
             const [isLoggingIn, setIsLoggingIn] = useState(false);
 
+            // Password change state variables
+            const [isChangingPassword, setIsChangingPassword] = useState(false);
+            const [currentPass, setCurrentPass] = useState('');
+            const [newPass, setNewPass] = useState('');
+            const [confirmPass, setConfirmPass] = useState('');
+            const [passError, setPassError] = useState(null);
+            const [passSuccess, setPassSuccess] = useState(null);
+            const [isSubmittingPass, setIsSubmittingPass] = useState(false);
+
             // Dashboard and sites state
-            const [sites, setSites] = useState([
-                { id: '1', name: 'Alpha Blog', url: 'https://site-alpha.com', wpVersion: '6.4.2', pendingUpdates: 4, lastBackupStatus: 'success', lastBackupTime: '2 hrs ago' },
-                { id: '2', name: 'Omega Shop', url: 'https://site-omega.com', wpVersion: '6.3.1', pendingUpdates: 0, lastBackupStatus: 'success', lastBackupTime: '1 day ago' },
-                { id: '3', name: 'Beta Agency', url: 'https://site-beta.com', wpVersion: '6.4.2', pendingUpdates: 12, lastBackupStatus: 'fail', lastBackupTime: '3 days ago' }
-            ]);
+            const [sites, setSites] = useState([]);
 
             const [vaultPlugins, setVaultPlugins] = useState([
                 { name: 'Sideload Security Suite', slug: 'sideload-security-suite', version: '4.1.2', author: 'WP Vault Devs' },
@@ -86,12 +91,42 @@
             const [jobStep, setJobStep] = useState('Initializing');
             const [sliderPos, setSliderPos] = useState(50);
 
+            // Fetch sites from CRUD backend API
+            const fetchSites = async () => {
+                try {
+                    const response = await fetch('/api/sites');
+                    if (response.ok) {
+                        const data = await response.json();
+                        setSites(data);
+                    }
+                } catch (err) {
+                    console.error('Failed to fetch sites from backend:', err);
+                }
+            };
+
             // Check if user session cookie is already present on initialization
             useEffect(() => {
-                const token = getCookie('wp_central_session');
-                if (token) {
-                    setIsAuthenticated(true);
-                }
+                fetch('/api/session')
+                    .then(res => {
+                        if (res.ok) {
+                            return res.json();
+                        }
+                        throw new Error('Not authenticated');
+                    })
+                    .then(data => {
+                        if (data.authenticated) {
+                            setIsAuthenticated(true);
+                            fetchSites();
+                        }
+                    })
+                    .catch(() => {
+                        // fallback to cookie detection
+                        const token = getCookie('wp_central_session');
+                        if (token) {
+                            setIsAuthenticated(true);
+                            fetchSites();
+                        }
+                    });
             }, []);
 
             // Summary metrics
@@ -158,10 +193,12 @@
                     const data = await response.json();
 
                     if (response.ok && data.token) {
-                        // Secure session cookies are set directly by the Express response headers in server.js,
-                        // but we also record state and persist token locally for authorization fallback
+                        // Secure session cookies are set directly by the Express response headers in server.js
                         document.cookie = `wp_central_session=${data.token}; max-age=2592000; path=/; SameSite=Strict`;
                         setIsAuthenticated(true);
+                        setTimeout(() => {
+                            fetchSites();
+                        }, 100);
                     } else {
                         setLoginError(data.error || 'Invalid credentials. Please try again.');
                     }
@@ -177,6 +214,7 @@
                 setIsAuthenticated(false);
                 setLoginEmail('');
                 setLoginPassword('');
+                setSites([]);
             };
 
             const handleBulkAction = (action) => {
@@ -190,6 +228,71 @@
                     setIsTriggeringBulk(false);
                     setSelectedSiteIds(new Set());
                 }, 1500);
+            };
+
+            // Dynamic site deletion
+            const handleDeleteSite = async (id) => {
+                if (!confirm('Are you sure you want to disconnect this WordPress node?')) return;
+                try {
+                    const response = await fetch(`/api/sites/${id}`, {
+                        method: 'DELETE'
+                    });
+                    if (response.ok) {
+                        fetchSites();
+                    } else {
+                        const data = await response.json();
+                        alert(data.error || 'Failed to delete site.');
+                    }
+                } catch (err) {
+                    alert('Error deleting site.');
+                }
+            };
+
+            // Dynamic safe password update execution
+            const handleChangePassword = async (e) => {
+                e.preventDefault();
+                setPassError(null);
+                setPassSuccess(null);
+
+                if (newPass !== confirmPass) {
+                    setPassError('New passwords do not match.');
+                    return;
+                }
+
+                if (newPass.length < 6) {
+                    setPassError('New password must be at least 6 characters long.');
+                    return;
+                }
+
+                setIsSubmittingPass(true);
+                try {
+                    const response = await fetch('/api/change-password', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            currentPassword: currentPass,
+                            newPassword: newPass
+                        })
+                    });
+
+                    const data = await response.json();
+                    if (response.ok) {
+                        setPassSuccess('Password successfully updated!');
+                        setCurrentPass('');
+                        setNewPass('');
+                        setConfirmPass('');
+                        setTimeout(() => {
+                            setIsChangingPassword(false);
+                            setPassSuccess(null);
+                        }, 1500);
+                    } else {
+                        setPassError(data.error || 'Failed to update password.');
+                    }
+                } catch (err) {
+                    setPassError('Network error trying to change password.');
+                } finally {
+                    setIsSubmittingPass(false);
+                }
             };
 
             // Simulated premium plugin file upload
@@ -323,6 +426,12 @@
                                 className="bg-violet-600 hover:bg-violet-700 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow-md shadow-violet-500/10"
                             >
                                 + Add New Site
+                            </button>
+                            <button
+                                onClick={() => setIsChangingPassword(true)}
+                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs px-4 py-2 rounded-lg transition border border-slate-700"
+                            >
+                                ⚙️ Change Password
                             </button>
                             <span className="text-xs font-mono text-slate-400 bg-slate-950 px-3 py-1.5 rounded-full border border-slate-800">
                                 🔑 Admin Mode
@@ -616,6 +725,12 @@
                                                             >
                                                                 Backup ({backupDest === 's3' ? 'S3' : 'Local'})
                                                             </button>
+                                                            <button
+                                                                onClick={() => handleDeleteSite(site.id)}
+                                                                className="bg-rose-950/20 hover:bg-rose-900 border border-rose-850/20 text-rose-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
+                                                            >
+                                                                Delete
+                                                            </button>
                                                         </div>
                                                     </td>
                                                 </tr>
@@ -713,6 +828,98 @@
                         </div>
                     </main>
 
+                    {/* Change Password Modal */}
+                    {isChangingPassword && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fadeIn">
+                            <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl w-full max-w-md space-y-4">
+                                <div className="flex justify-between items-center">
+                                    <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                                        <span>⚙️ Change Admin Password</span>
+                                    </h3>
+                                    <button
+                                        onClick={() => {
+                                            setIsChangingPassword(false);
+                                            setPassError(null);
+                                            setPassSuccess(null);
+                                        }}
+                                        className="text-slate-400 hover:text-white font-bold text-lg"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                {passError && (
+                                    <div className="p-3 rounded-lg bg-rose-950/20 border border-rose-900/50 text-rose-300 text-xs font-semibold">
+                                        ⚠️ {passError}
+                                    </div>
+                                )}
+
+                                {passSuccess && (
+                                    <div className="p-3 rounded-lg bg-emerald-950/20 border border-emerald-900/50 text-emerald-300 text-xs font-semibold">
+                                        ✓ {passSuccess}
+                                    </div>
+                                )}
+
+                                <form onSubmit={handleChangePassword} className="space-y-3">
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-400 block mb-1">Current Password</label>
+                                        <input
+                                            type="password"
+                                            required
+                                            value={currentPass}
+                                            onChange={(e) => setCurrentPass(e.target.value)}
+                                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                                            placeholder="Current Password"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-400 block mb-1">New Password</label>
+                                        <input
+                                            type="password"
+                                            required
+                                            value={newPass}
+                                            onChange={(e) => setNewPass(e.target.value)}
+                                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                                            placeholder="At least 6 characters"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-400 block mb-1">Confirm New Password</label>
+                                        <input
+                                            type="password"
+                                            required
+                                            value={confirmPass}
+                                            onChange={(e) => setConfirmPass(e.target.value)}
+                                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                                            placeholder="Verify new password"
+                                        />
+                                    </div>
+
+                                    <div className="flex gap-2 justify-end pt-4">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setIsChangingPassword(false);
+                                                setPassError(null);
+                                                setPassSuccess(null);
+                                            }}
+                                            className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-4 py-2 rounded-lg font-bold"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            type="submit"
+                                            disabled={isSubmittingPass}
+                                            className="bg-violet-600 hover:bg-violet-700 text-white text-xs px-4 py-2 rounded-lg font-bold transition disabled:opacity-50"
+                                        >
+                                            {isSubmittingPass ? 'Updating...' : 'Save Password'}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
                     {/* Add Site Modal Form */}
                     {isAddingSite && (
                         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fadeIn">
@@ -759,19 +966,25 @@
                                         Cancel
                                     </button>
                                     <button
-                                        onClick={() => {
+                                        onClick={async () => {
                                             if (newSite.name && newSite.url) {
-                                                setSites([...sites, {
-                                                    id: (sites.length + 1).toString(),
-                                                    name: newSite.name,
-                                                    url: newSite.url,
-                                                    wpVersion: '6.4.2',
-                                                    pendingUpdates: 0,
-                                                    lastBackupStatus: 'success',
-                                                    lastBackupTime: 'Just now'
-                                                }]);
-                                                setNewSite({ name: '', url: '', secretKey: '' });
-                                                setIsAddingSite(false);
+                                                try {
+                                                    const res = await fetch('/api/sites', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify(newSite)
+                                                    });
+                                                    if (res.ok) {
+                                                        fetchSites();
+                                                        setNewSite({ name: '', url: '', secretKey: '' });
+                                                        setIsAddingSite(false);
+                                                    } else {
+                                                        const data = await res.json();
+                                                        alert(data.error || 'Failed to add site.');
+                                                    }
+                                                } catch (err) {
+                                                    alert('Error adding site.');
+                                                }
                                             }
                                         }}
                                         className="bg-violet-600 hover:bg-violet-700 text-white text-xs px-4 py-2 rounded-lg font-bold"

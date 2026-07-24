@@ -24,31 +24,97 @@ if (!fs.existsSync(VAULT_DIR)) {
 // Multer storage for uploaded plugin packages
 const upload = multer({ dest: path.join(__dirname, 'temp_uploads') });
 
-// In-memory Database stores
-const ADMIN_CREDENTIALS = {
-    username: process.env.DASHBOARD_ADMIN_USER || 'admin',
-    passwordHash: crypto.createHash('sha256').update(process.env.DASHBOARD_ADMIN_PASS || 'SecurePassword123').digest('hex')
-};
+// File-based JSON Database persistence helpers
+const DB_PATH = path.join(__dirname, 'data.json');
 
-const TOKEN_SECRET = crypto.randomBytes(32).toString('hex');
-const ACTIVE_TOKENS = new Set();
-
-const SITES_DB = {
-    'example-wp-site': {
-        url: 'http://localhost:8080',
-        secretKey: 'wp_central_shared_secret_key_999',
-        dashboardBaseUrl: 'http://localhost:3002',
-        s3Config: {
-            bucket: 'wp-backups-bucket',
-            endpoint: 'https://s3.us-east-1.amazonaws.com',
-            region: 'us-east-1',
-            accessKey: 'MOCK_S3_ACCESS_KEY',
-            secretKey: 'MOCK_S3_SECRET_KEY'
+function loadDB() {
+    try {
+        if (fs.existsSync(DB_PATH)) {
+            const content = fs.readFileSync(DB_PATH, 'utf8');
+            return JSON.parse(content);
         }
+    } catch (err) {
+        console.error('[DB Error] Failed to load JSON database:', err);
     }
-};
+    // Fallback default structure
+    const fallback = {
+        admin: {
+            username: process.env.DASHBOARD_ADMIN_USER || 'admin@example.com',
+            passwordHash: crypto.createHash('sha256').update(process.env.DASHBOARD_ADMIN_PASS || 'SecurePassword123').digest('hex')
+        },
+        tokenSecret: crypto.randomBytes(32).toString('hex'),
+        sites: [
+            {
+                id: 'example-wp-site',
+                name: 'Local WP Container',
+                url: 'http://localhost:8080',
+                secretKey: 'wp_central_shared_secret_key_999',
+                dashboardBaseUrl: 'http://localhost:3002',
+                wpVersion: '6.4.2',
+                pendingUpdates: 2,
+                lastBackupStatus: 'success',
+                lastBackupTime: '2 hrs ago',
+                s3Config: {
+                    bucket: 'wp-backups-bucket',
+                    endpoint: 'https://s3.us-east-1.amazonaws.com',
+                    region: 'us-east-1',
+                    accessKey: 'MOCK_S3_ACCESS_KEY',
+                    secretKey: 'MOCK_S3_SECRET_KEY'
+                }
+            }
+        ],
+        vault: {}
+    };
+    try {
+        fs.writeFileSync(DB_PATH, JSON.stringify(fallback, null, 2), 'utf8');
+    } catch (e) {}
+    return fallback;
+}
 
-const VAULT_DB = {};
+function saveDB(data) {
+    try {
+        fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), 'utf8');
+    } catch (err) {
+        console.error('[DB Error] Failed to save JSON database:', err);
+    }
+}
+
+/**
+ * Verify Session Token (Stateless but persistent & cryptographically signed)
+ * Tokens contain the login username and absolute expiration timestamp (30 days from generation)
+ * Decodes, checks expiration, and validates HMAC against DB-persisted tokenSecret.
+ */
+function verifyToken(token) {
+    if (!token) return null;
+    try {
+        const decoded = Buffer.from(token, 'base64').toString('utf8');
+        const lastDotIndex = decoded.lastIndexOf('.');
+        if (lastDotIndex === -1) return null;
+
+        const payload = decoded.substring(0, lastDotIndex);
+        const signature = decoded.substring(lastDotIndex + 1);
+
+        const db = loadDB();
+        const expectedSignature = crypto.createHmac('sha256', db.tokenSecret).update(payload).digest('hex');
+
+        // Timing-safe signature check
+        const sigBuf = Buffer.from(signature, 'hex');
+        const expectedBuf = Buffer.from(expectedSignature, 'hex');
+        if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+            return null;
+        }
+
+        const [username, expiresAtStr] = payload.split(':');
+        const expiresAt = parseInt(expiresAtStr, 10);
+        if (isNaN(expiresAt) || Date.now() > expiresAt) {
+            return null; // Expired session
+        }
+
+        return { username };
+    } catch (err) {
+        return null;
+    }
+}
 
 /**
  * Authentication Middleware
@@ -75,10 +141,12 @@ function requireAuth(req, res, next) {
         token = cookies['wp_central_session'];
     }
 
-    if (!token || !ACTIVE_TOKENS.has(token)) {
+    const session = verifyToken(token);
+    if (!session) {
         return res.status(401).json({ error: 'Access Denied. Please sign in with admin credentials.' });
     }
 
+    req.user = session;
     next();
 }
 
@@ -88,6 +156,39 @@ function requireAuth(req, res, next) {
  */
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+/**
+ * Endpoint to check login session state
+ * GET /api/session
+ */
+app.get('/api/session', (req, res) => {
+    let token = null;
+
+    // Extract from Authorization header
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+    }
+
+    // Extract from cookies
+    if (!token && req.headers.cookie) {
+        const cookies = {};
+        req.headers.cookie.split(';').forEach(cookie => {
+            const parts = cookie.split('=');
+            if (parts.length >= 2) {
+                cookies[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('='));
+            }
+        });
+        token = cookies['wp_central_session'];
+    }
+
+    const session = verifyToken(token);
+    if (!session) {
+        return res.status(401).json({ authenticated: false });
+    }
+
+    return res.json({ authenticated: true, username: session.username });
 });
 
 /**
@@ -102,21 +203,25 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ error: 'Username and password are required.' });
     }
 
-    console.log('[DEBUG LOGIN] Received username:', username, 'password:', password);
-    console.log('[DEBUG LOGIN] Expected username:', ADMIN_CREDENTIALS.username, 'expected hash:', ADMIN_CREDENTIALS.passwordHash);
+    const db = loadDB();
+    const adminUsername = db.admin.username;
+    const adminPasswordHash = db.admin.passwordHash;
 
-    // Accept administrative login (any matching admin email format or username)
-    const isMatchingUsername = username === ADMIN_CREDENTIALS.username || username.split('@')[0] === ADMIN_CREDENTIALS.username;
+    console.log('[DEBUG LOGIN] Received username:', username, 'password:', password);
+    console.log('[DEBUG LOGIN] Expected username:', adminUsername, 'expected hash:', adminPasswordHash);
+
+    // Accept administrative login (any matching admin email format or username prefix)
+    const isMatchingUsername = username === adminUsername || username.split('@')[0] === adminUsername.split('@')[0];
     const inputHash = crypto.createHash('sha256').update(password).digest('hex');
 
-    console.log('[DEBUG LOGIN] user match:', isMatchingUsername, 'pass match:', inputHash === ADMIN_CREDENTIALS.passwordHash);
+    console.log('[DEBUG LOGIN] user match:', isMatchingUsername, 'pass match:', inputHash === adminPasswordHash);
 
-    if (isMatchingUsername && inputHash === ADMIN_CREDENTIALS.passwordHash) {
-        const tokenPayload = `${username}:${Date.now()}`;
-        const signature = crypto.createHmac('sha256', TOKEN_SECRET).update(tokenPayload).digest('hex');
+    if (isMatchingUsername && inputHash === adminPasswordHash) {
+        // Generate stateless signed token with 30-day expiration
+        const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
+        const tokenPayload = `${username}:${expiresAt}`;
+        const signature = crypto.createHmac('sha256', db.tokenSecret).update(tokenPayload).digest('hex');
         const token = Buffer.from(`${tokenPayload}.${signature}`).toString('base64');
-
-        ACTIVE_TOKENS.add(token);
 
         // Set secure session cookie valid for 30 days (2592000 seconds)
         res.setHeader('Set-Cookie', `wp_central_session=${token}; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict`);
@@ -128,6 +233,84 @@ app.post('/api/login', (req, res) => {
     }
 
     return res.status(401).json({ error: 'Invalid username or password.' });
+});
+
+/**
+ * Endpoint to change password safely
+ * POST /api/change-password
+ * Protected by requireAuth
+ */
+app.post('/api/change-password', requireAuth, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+        return res.status(400).json({ error: 'Current password and new password are required.' });
+    }
+
+    const db = loadDB();
+    const currentHash = crypto.createHash('sha256').update(currentPassword).digest('hex');
+
+    if (currentHash !== db.admin.passwordHash) {
+        return res.status(400).json({ error: 'Incorrect current password.' });
+    }
+
+    db.admin.passwordHash = crypto.createHash('sha256').update(newPassword).digest('hex');
+    saveDB(db);
+
+    res.json({ message: 'Password successfully changed.' });
+});
+
+/**
+ * CRUD Connected Site Routes (Protected)
+ */
+app.get('/api/sites', requireAuth, (req, res) => {
+    const db = loadDB();
+    res.json(db.sites || []);
+});
+
+app.post('/api/sites', requireAuth, (req, res) => {
+    const { name, url, secretKey } = req.body;
+    if (!name || !url) {
+        return res.status(400).json({ error: 'Site name and URL are required.' });
+    }
+
+    const db = loadDB();
+    const newId = crypto.randomUUID ? crypto.randomUUID() : `site_${Date.now()}`;
+    const newSite = {
+        id: newId,
+        name,
+        url,
+        secretKey: secretKey || 'wp_central_shared_secret_key_999',
+        dashboardBaseUrl: `http://localhost:${PORT}`,
+        wpVersion: '6.4.2',
+        pendingUpdates: 0,
+        lastBackupStatus: 'success',
+        lastBackupTime: 'Never',
+        s3Config: {
+            bucket: 'wp-backups-bucket',
+            endpoint: 'https://s3.us-east-1.amazonaws.com',
+            region: 'us-east-1',
+            accessKey: 'MOCK_S3_ACCESS_KEY',
+            secretKey: 'MOCK_S3_SECRET_KEY'
+        }
+    };
+
+    db.sites = db.sites || [];
+    db.sites.push(newSite);
+    saveDB(db);
+
+    res.status(201).json(newSite);
+});
+
+app.delete('/api/sites/:siteId', requireAuth, (req, res) => {
+    const { siteId } = req.params;
+    const db = loadDB();
+    const initialLength = db.sites.length;
+    db.sites = db.sites.filter(s => s.id !== siteId);
+    if (db.sites.length === initialLength) {
+        return res.status(404).json({ error: 'Site not found.' });
+    }
+    saveDB(db);
+    res.json({ message: 'Site successfully deleted.' });
 });
 
 /**
@@ -201,7 +384,10 @@ app.post('/api/plugins/upload', requireAuth, upload.single('plugin'), (req, res)
             uploadedAt: new Date().toISOString()
         };
 
-        VAULT_DB[detectedSlug] = metadata;
+        const db = loadDB();
+        db.vault = db.vault || {};
+        db.vault[detectedSlug] = metadata;
+        saveDB(db);
 
         console.log(`[Plugin Vault] Successfully uploaded and parsed plugin: ${pluginName} (${detectedSlug}) v${version}`);
 
@@ -233,7 +419,8 @@ app.get('/api/plugins/download/:slug', (req, res) => {
     }
 
     // Look up local plugin metadata
-    const metadata = VAULT_DB[slug];
+    const db = loadDB();
+    const metadata = db.vault ? db.vault[slug] : null;
     const zipPath = path.join(VAULT_DIR, `${slug}.zip`);
 
     if (!metadata || !fs.existsSync(zipPath)) {
@@ -255,7 +442,7 @@ app.get('/api/plugins/download/:slug', (req, res) => {
         }
 
         // Validate HMAC Signature using shared secret
-        const siteKey = SITES_DB['example-wp-site'].secretKey;
+        const siteKey = db.sites && db.sites.length > 0 ? db.sites[0].secretKey : 'wp_central_shared_secret_key_999';
         const dataToSign = `${slug}:${expires}`;
         const expectedSignature = crypto
             .createHmac('sha256', siteKey)
@@ -290,7 +477,8 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const { siteId } = req.params;
     const { type, plugins, backup_destination } = req.body;
 
-    const site = SITES_DB[siteId];
+    const db = loadDB();
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
     if (!site) {
         return res.status(404).json({ error: 'Site not registered on dashboard.' });
     }
@@ -322,7 +510,8 @@ app.get('/health', (req, res) => {
 
 // Provide a way for testing script to retrieve VAULT_DB
 app.get('/api/test/vault', (req, res) => {
-    res.json(VAULT_DB);
+    const db = loadDB();
+    res.json(db.vault || {});
 });
 
 app.listen(PORT, () => {
