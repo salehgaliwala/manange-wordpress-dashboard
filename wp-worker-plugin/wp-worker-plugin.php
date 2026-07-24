@@ -135,6 +135,39 @@ class WPCentral_Worker_Controller {
             'callback'            => array($this, 'get_job_status'),
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
+
+        register_rest_route('wp-central/v1', '/status', array(
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => array($this, 'get_wp_status'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
+    }
+
+    /**
+     * Return WordPress status, version, and pending updates count
+     * GET /wp-json/wp-central/v1/status
+     */
+    public function get_wp_status(WP_REST_Request $request) {
+        require_once ABSPATH . 'wp-admin/includes/update.php';
+
+        $core_updates = get_core_updates();
+        $pending_core = 0;
+        if (!empty($core_updates) && isset($core_updates[0]->response) && $core_updates[0]->response === 'upgrade') {
+            $pending_core = 1;
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        $plugins = get_plugins();
+        $plugin_updates = get_plugin_updates();
+        $pending_plugins = count($plugin_updates);
+
+        return new WP_REST_Response(array(
+            'status'          => 'ok',
+            'wp_version'      => get_bloginfo('version'),
+            'pending_core'    => $pending_core,
+            'pending_plugins' => $pending_plugins,
+            'total_updates'   => $pending_core + $pending_plugins
+        ), 200);
     }
 
     /**
@@ -257,7 +290,7 @@ class WPCentral_Worker_Controller {
 
                 // Cleanup workspace zip
                 $this->recursive_cleanup($temp_dir);
-                $final_path = 'S3 Cloud Storage';
+                $final_path = 'S3 Cloud Storage Bucket: ' . $job_data['s3_config']['bucket'];
             } else {
                 // Save locally to a secure directory: wp-content/uploads/wp-central-backups/
                 $local_vault = WP_CONTENT_DIR . '/uploads/wp-central-backups';
@@ -312,6 +345,20 @@ class WPCentral_Worker_Controller {
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
         require_once ABSPATH . 'wp-admin/includes/admin.php';
+
+        // Initialize WordPress Filesystem API to prevent silent file write failures
+        global $wp_filesystem;
+        if (empty($wp_filesystem)) {
+            ob_start();
+            $creds = request_filesystem_credentials('', '', false, false, null);
+            ob_end_clean();
+            if (!WP_Filesystem($creds)) {
+                if (!defined('FS_METHOD')) {
+                    define('FS_METHOD', 'direct');
+                }
+                WP_Filesystem();
+            }
+        }
 
         // Force FS_METHOD 'direct' to bypass prompt credentials
         if (!defined('FS_METHOD')) {
