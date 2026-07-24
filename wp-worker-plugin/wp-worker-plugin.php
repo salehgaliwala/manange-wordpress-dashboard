@@ -340,11 +340,23 @@ class WPCentral_Worker_Controller {
         $params = $request->get_json_params();
         $type = sanitize_text_field($params['type']); // 'core' or 'plugin'
 
-        // Load WordPress administrative upgrader utilities
+        // 1. Elevate REST capability privilege context to Administrator programmatically
+        $admin_users = get_users(array('role' => 'Administrator'));
+        $admin_id = (!empty($admin_users)) ? $admin_users[0]->ID : 1;
+        wp_set_current_user($admin_id);
+
+        if (!defined('WP_ADMIN')) {
+            define('WP_ADMIN', true);
+        }
+
+        // Load complete WordPress administrative upgrader utilities
         require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/theme.php';
         require_once ABSPATH . 'wp-admin/includes/admin.php';
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
 
         // Initialize WordPress Filesystem API to prevent silent file write failures
         global $wp_filesystem;
@@ -366,11 +378,15 @@ class WPCentral_Worker_Controller {
         }
         add_filter('request_filesystem_credentials', '__return_true', 100);
 
+        // Suppress any output/skin prints to prevent REST JSON response corruption
+        ob_start();
+
         if ($type === 'core') {
             $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
             $updates = get_core_updates();
 
             if (empty($updates)) {
+                ob_end_clean();
                 return new WP_REST_Response(array(
                     'status'  => 'success',
                     'message' => 'WordPress Core is already up to date.'
@@ -378,6 +394,8 @@ class WPCentral_Worker_Controller {
             }
 
             $result = $upgrader->upgrade($updates[0]);
+            ob_end_clean();
+
             if (is_wp_error($result)) {
                 return new WP_REST_Response(array(
                     'status'  => 'error',
@@ -394,6 +412,7 @@ class WPCentral_Worker_Controller {
         } elseif ($type === 'plugin') {
             $plugins = $params['plugins']; // Array of strings or objects: e.g., [{"file": "akismet/akismet.php", "package_url": "..."}]
             if (empty($plugins) || !is_array($plugins)) {
+                ob_end_clean();
                 return new WP_REST_Response(array(
                     'status'  => 'error',
                     'message' => 'A valid list of plugins must be provided.'
@@ -465,6 +484,8 @@ class WPCentral_Worker_Controller {
                 $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
             }
 
+            ob_end_clean();
+
             return new WP_REST_Response(array(
                 'status'           => 'success',
                 'message'          => 'Plugins update operation completed.',
@@ -472,6 +493,8 @@ class WPCentral_Worker_Controller {
                 'standard_results' => $standard_results
             ), 200);
         }
+
+        ob_end_clean();
 
         return new WP_REST_Response(array(
             'status'  => 'error',
