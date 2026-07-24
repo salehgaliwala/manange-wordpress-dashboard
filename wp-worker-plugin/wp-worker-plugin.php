@@ -357,6 +357,7 @@ class WPCentral_Worker_Controller {
         require_once ABSPATH . 'wp-admin/includes/admin.php';
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+        require_once ABSPATH . 'wp-admin/includes/update.php';
 
         // Initialize WordPress Filesystem API to prevent silent file write failures
         global $wp_filesystem;
@@ -382,6 +383,9 @@ class WPCentral_Worker_Controller {
         ob_start();
 
         if ($type === 'core') {
+            // Force WP version check to populate update transients
+            wp_version_check();
+
             $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
             $updates = get_core_updates();
 
@@ -418,6 +422,9 @@ class WPCentral_Worker_Controller {
                     'message' => 'A valid list of plugins must be provided.'
                 ), 400);
             }
+
+            // Force WP to check available plugin updates and populate transients
+            wp_update_plugins();
 
             $standard_upgrades = array();
             $custom_upgrades_results = array();
@@ -483,6 +490,10 @@ class WPCentral_Worker_Controller {
             if (!empty($standard_upgrades)) {
                 $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
             }
+
+            // Flush plugins cache and delete site transients so WP Admin reflects the updated values immediately
+            wp_clean_plugins_cache(true);
+            delete_site_transient('update_plugins');
 
             ob_end_clean();
 
