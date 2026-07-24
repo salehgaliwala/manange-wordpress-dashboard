@@ -1,7 +1,7 @@
 {
   "admin": {
     "username": "admin@example.com",
-    "passwordHash": "56d133479cab9bdadda487fedb5e9d059be10ce9a4817ace201ba1e454d140f2"
+    "passwordHash": "245b22dce938051efc28cf4364928fa26e171db139755311a93703ba65fd6d07"
   },
   "tokenSecret": "df061801d368e7b399cf766ea9d99763261a9bb7fbeeb2491b32cc6ef784e12c",
   "sites": [
@@ -78,14 +78,5 @@
       }
     }
   ],
-  "vault": {
-    "premium-vault-plugin": {
-      "name": "Premium Custom Vault Plugin",
-      "slug": "premium-vault-plugin",
-      "version": "2.1.4",
-      "author": "Vault Development Corp",
-      "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-24T09:50:15.605Z"
-    }
-  }
+  "vault": {}
 }
