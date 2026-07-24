@@ -31,8 +31,28 @@
     <script type="text/babel">
         const { useState, useMemo, useEffect, useRef } = React;
 
+        // Helper to read cookie value
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+            return null;
+        }
+
+        // Helper to erase cookie
+        function eraseCookie(name) {
+            document.cookie = name +'=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+        }
+
         function App() {
-            // State
+            // Authentication session states
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [loginEmail, setLoginEmail] = useState('');
+            const [loginPassword, setLoginPassword] = useState('');
+            const [loginError, setLoginError] = useState(null);
+            const [isLoggingIn, setIsLoggingIn] = useState(false);
+
+            // Dashboard and sites state
             const [sites, setSites] = useState([
                 { id: '1', name: 'Alpha Blog', url: 'https://site-alpha.com', wpVersion: '6.4.2', pendingUpdates: 4, lastBackupStatus: 'success', lastBackupTime: '2 hrs ago' },
                 { id: '2', name: 'Omega Shop', url: 'https://site-omega.com', wpVersion: '6.3.1', pendingUpdates: 0, lastBackupStatus: 'success', lastBackupTime: '1 day ago' },
@@ -49,17 +69,30 @@
             const [activeJobId, setActiveJobId] = useState(null);
             const [isTriggeringBulk, setIsTriggeringBulk] = useState(false);
             const [bulkActionResult, setBulkActionResult] = useState(null);
+
+            // Site management modal states
             const [isAddingSite, setIsAddingSite] = useState(false);
             const [newSite, setNewSite] = useState({ name: '', url: '', secretKey: '' });
 
             // Sideload upload simulation state
-            const [uploadStatus, setUploadStatus] = useState('idle'); // 'idle'|'uploading'|'success'
+            const [uploadStatus, setUploadStatus] = useState('idle');
             const [parsedPlugin, setParsedPlugin] = useState(null);
+
+            // Backup destination preference ('s3' or 'local')
+            const [backupDest, setBackupDest] = useState('s3');
 
             // Job queue tracking simulation state
             const [jobProgress, setJobProgress] = useState(0);
             const [jobStep, setJobStep] = useState('Initializing');
             const [sliderPos, setSliderPos] = useState(50);
+
+            // Check if user session cookie is already present on initialization
+            useEffect(() => {
+                const token = getCookie('wp_central_session');
+                if (token) {
+                    setIsAuthenticated(true);
+                }
+            }, []);
 
             // Summary metrics
             const sitesCount = sites.length;
@@ -97,13 +130,62 @@
             const isAllSelected = filteredSites.length > 0 && selectedSiteIds.size === filteredSites.length;
             const isSomeSelected = selectedSiteIds.size > 0 && selectedSiteIds.size < filteredSites.length;
 
+            /**
+             * Authenticates admin using email and password
+             */
+            const handleLogin = async (e) => {
+                e.preventDefault();
+                setLoginError(null);
+                setIsLoggingIn(true);
+
+                // Simple client side email format check
+                if (!loginEmail.includes('@') || !loginEmail.includes('.')) {
+                    setLoginError('Please enter a valid administrative email address.');
+                    setIsLoggingIn(false);
+                    return;
+                }
+
+                try {
+                    const response = await fetch('/api/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            username: loginEmail,
+                            password: loginPassword
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok && data.token) {
+                        // Secure session cookies are set directly by the Express response headers in server.js,
+                        // but we also record state and persist token locally for authorization fallback
+                        document.cookie = `wp_central_session=${data.token}; max-age=2592000; path=/; SameSite=Strict`;
+                        setIsAuthenticated(true);
+                    } else {
+                        setLoginError(data.error || 'Invalid credentials. Please try again.');
+                    }
+                } catch (err) {
+                    setLoginError('Could not connect to the central dashboard authentication service.');
+                } finally {
+                    setIsLoggingIn(false);
+                }
+            };
+
+            const handleLogout = () => {
+                eraseCookie('wp_central_session');
+                setIsAuthenticated(false);
+                setLoginEmail('');
+                setLoginPassword('');
+            };
+
             const handleBulkAction = (action) => {
                 setIsTriggeringBulk(true);
                 setBulkActionResult(null);
                 setTimeout(() => {
                     setBulkActionResult({
                         success: true,
-                        message: `Successfully triggered bulk ${action} concurrently for ${selectedSiteIds.size} remote site(s)!`
+                        message: `Successfully triggered bulk ${action} concurrently using ${backupDest.toUpperCase()} destination for ${selectedSiteIds.size} site(s)!`
                     });
                     setIsTriggeringBulk(false);
                     setSelectedSiteIds(new Set());
@@ -140,7 +222,7 @@
                     progress += 10;
                     setJobProgress(progress);
 
-                    if (progress < 25) setJobStep('Triggering remote backup and dumping database...');
+                    if (progress < 25) setJobStep(`Triggering remote backup to ${backupDest.toUpperCase()} destination...`);
                     else if (progress < 50) setJobStep('Capturing pre-update full-page screenshot...');
                     else if (progress < 75) setJobStep('Executing WordPress Upgrader package sideload...');
                     else if (progress < 90) setJobStep('Running post-update visual regression analysis...');
@@ -152,6 +234,75 @@
                 }, 800);
             };
 
+            // RENDER LOGIN SCREEN GATES IF NOT AUTHENTICATED
+            if (!isAuthenticated) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center bg-slate-950 p-6">
+                        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8 space-y-6">
+                            <div className="text-center space-y-2">
+                                <div className="w-12 h-12 rounded-2xl bg-violet-600 flex items-center justify-center font-bold text-white shadow-lg shadow-violet-500/20 text-2xl mx-auto">
+                                    W
+                                </div>
+                                <h2 className="text-xl font-black text-white uppercase tracking-tight">WP Central Sign In</h2>
+                                <p className="text-xs text-slate-500 font-mono tracking-widest uppercase">Administrative Access Panel</p>
+                            </div>
+
+                            {loginError && (
+                                <div className="p-4 rounded-xl bg-rose-950/20 border border-rose-900/50 text-rose-300 text-xs font-semibold">
+                                    ⚠️ {loginError}
+                                </div>
+                            )}
+
+                            <form onSubmit={handleLogin} className="space-y-4">
+                                <div>
+                                    <label className="text-xs font-bold text-slate-400 block mb-1">Email Address</label>
+                                    <input
+                                        type="email"
+                                        required
+                                        value={loginEmail}
+                                        onChange={(e) => setLoginEmail(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                                        placeholder="admin@example.com"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-bold text-slate-400 block mb-1">Password</label>
+                                    <input
+                                        type="password"
+                                        required
+                                        value={loginPassword}
+                                        onChange={(e) => setLoginPassword(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                                        placeholder="••••••••••••"
+                                    />
+                                </div>
+
+                                <div className="flex items-center justify-between pt-2">
+                                    <label className="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" defaultChecked className="rounded border-slate-800 text-violet-600 bg-slate-950 focus:ring-0 focus:ring-offset-0 cursor-pointer w-4 h-4" />
+                                        <span className="text-xs text-slate-400 font-medium">Keep signed in (30 days)</span>
+                                    </label>
+                                </div>
+
+                                <button
+                                    type="submit"
+                                    disabled={isLoggingIn}
+                                    className="w-full bg-violet-600 hover:bg-violet-700 text-white font-bold py-3 rounded-lg text-sm transition shadow-md shadow-violet-500/10 flex items-center justify-center gap-2"
+                                >
+                                    {isLoggingIn ? (
+                                        <>
+                                            <span className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin"></span>
+                                            Authenticating Secure Session...
+                                        </>
+                                    ) : 'Access Dashboard'}
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                );
+            }
+
+            // RENDER INTERACTIVE DASHBOARD SYSTEM
             return (
                 <div className="min-h-screen flex flex-col">
                     {/* Navigation Header */}
@@ -176,6 +327,12 @@
                             <span className="text-xs font-mono text-slate-400 bg-slate-950 px-3 py-1.5 rounded-full border border-slate-800">
                                 🔑 Admin Mode
                             </span>
+                            <button
+                                onClick={handleLogout}
+                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs px-4 py-2 rounded-lg transition"
+                            >
+                                Sign Out
+                            </button>
                         </div>
                     </header>
 
@@ -200,6 +357,32 @@
                                     {failedBackups}
                                 </span>
                                 <p className="text-xs text-slate-400 mt-2">Backups failing to stream directly to S3</p>
+                            </div>
+                        </div>
+
+                        {/* Backup Destination preference selector */}
+                        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between text-sm">
+                            <div className="flex items-center gap-2">
+                                <span className="text-slate-400 font-semibold">Backup Destination Preference:</span>
+                                <span className="text-slate-500">Determine where automated update pipelines save backup archives</span>
+                            </div>
+                            <div className="flex bg-slate-950 border border-slate-800 rounded-lg p-1">
+                                <button
+                                    onClick={() => setBackupDest('s3')}
+                                    className={`px-3 py-1.5 rounded-md font-bold text-xs transition ${
+                                        backupDest === 's3' ? 'bg-violet-600 text-white shadow' : 'text-slate-400 hover:text-white'
+                                    }`}
+                                >
+                                    S3 Compatible Cloud
+                                </button>
+                                <button
+                                    onClick={() => setBackupDest('local')}
+                                    className={`px-3 py-1.5 rounded-md font-bold text-xs transition ${
+                                        backupDest === 'local' ? 'bg-violet-600 text-white shadow' : 'text-slate-400 hover:text-white'
+                                    }`}
+                                >
+                                    Local WP Disk
+                                </button>
                             </div>
                         </div>
 
@@ -270,7 +453,7 @@
                                                         className="absolute inset-y-0 left-0 h-full bg-cover bg-center"
                                                         style={{
                                                             backgroundImage: `url('https://images.unsplash.com/photo-1531403009284-440f080d1e12?auto=format&fit=crop&w=1200&q=80')`,
-                                                            filter: 'hue-rotate(90deg)', // slightly different for visual regression mockup
+                                                            filter: 'hue-rotate(90deg)',
                                                             width: '100vw'
                                                         }}
                                                     />
@@ -409,7 +592,7 @@
                                                     <td className="py-4 px-4 text-xs">
                                                         {site.lastBackupStatus === 'success' ? (
                                                             <div className="flex flex-col gap-0.5">
-                                                                <span className="text-slate-400 font-medium">S3 Secured</span>
+                                                                <span className="text-slate-400 font-medium">{site.lastBackupTime.includes('Just') ? 'Local Disk Secured' : 'S3 Secured'}</span>
                                                                 <span className="text-[10px] text-slate-500 font-mono">{site.lastBackupTime}</span>
                                                             </div>
                                                         ) : (
@@ -426,11 +609,12 @@
                                                             </button>
                                                             <button
                                                                 onClick={() => {
-                                                                    alert('Backup triggered for: ' + site.name);
+                                                                    alert(`Backup triggered to ${backupDest.toUpperCase()} for: ${site.name}`);
+                                                                    setSites(sites.map(s => s.id === site.id ? { ...s, lastBackupStatus: 'success', lastBackupTime: 'Just now' } : s));
                                                                 }}
                                                                 className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-semibold text-xs px-2.5 py-1.5 rounded transition"
                                                             >
-                                                                Backup
+                                                                Backup ({backupDest === 's3' ? 'S3' : 'Local'})
                                                             </button>
                                                         </div>
                                                     </td>

@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: WP Central Worker Plugin
- * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups to S3, automated updates, and custom plugin vault sideloading.
- * Version: 1.1.1
+ * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups (to S3 or local disk), automated updates, and custom plugin vault sideloading.
+ * Version: 1.2.0
  * Author: WP Central Team
  * License: GPL2
  */
@@ -138,22 +138,36 @@ class WPCentral_Worker_Controller {
     }
 
     /**
-     * Initiates non-blocking background backup
+     * Initiates non-blocking background backup (supports Local and S3 destinations)
      * POST /wp-json/wp-central/v1/backup
      */
     public function handle_backup_initiation(WP_REST_Request $request) {
         $params = $request->get_json_params();
 
-        // Validate S3 inputs
-        $required = array('s3_bucket', 's3_endpoint', 's3_region', 's3_access_key', 's3_secret_key');
-        foreach ($required as $field) {
-            if (empty($params[$field])) {
-                return new WP_Error(
-                    'missing_parameter',
-                    sprintf(__('The parameter "%s" is required.', 'wp-central'), $field),
-                    array('status' => 400)
-                );
+        $destination = isset($params['backup_destination']) ? sanitize_text_field($params['backup_destination']) : 's3';
+
+        $s3_config = array();
+
+        // Validate S3 inputs only if destination is set to cloud S3
+        if ($destination === 's3') {
+            $required = array('s3_bucket', 's3_endpoint', 's3_region', 's3_access_key', 's3_secret_key');
+            foreach ($required as $field) {
+                if (empty($params[$field])) {
+                    return new WP_Error(
+                        'missing_parameter',
+                        sprintf(__('The parameter "%s" is required for S3 backup.', 'wp-central'), $field),
+                        array('status' => 400)
+                    );
+                }
             }
+
+            $s3_config = array(
+                'bucket'     => sanitize_text_field($params['s3_bucket']),
+                'endpoint'   => esc_url_raw($params['s3_endpoint']),
+                'region'     => sanitize_text_field($params['s3_region']),
+                'access_key' => sanitize_text_field($params['s3_access_key']),
+                'secret_key' => sanitize_text_field($params['s3_secret_key'])
+            );
         }
 
         // Generate unique Job ID
@@ -161,17 +175,12 @@ class WPCentral_Worker_Controller {
 
         // Store Job State and configuration securely in options
         $job_data = array(
-            'status'     => 'pending',
-            'type'       => 'backup',
-            'progress'   => 0,
-            'created_at' => time(),
-            's3_config'  => array(
-                'bucket'     => sanitize_text_field($params['s3_bucket']),
-                'endpoint'   => esc_url_raw($params['s3_endpoint']),
-                'region'     => sanitize_text_field($params['s3_region']),
-                'access_key' => sanitize_text_field($params['s3_access_key']),
-                'secret_key' => sanitize_text_field($params['s3_secret_key'])
-            )
+            'status'             => 'pending',
+            'type'               => 'backup',
+            'backup_destination' => $destination,
+            'progress'           => 0,
+            'created_at'         => time(),
+            's3_config'          => $s3_config
         );
         update_option('wp_central_job_' . $job_id, $job_data);
 
@@ -222,6 +231,8 @@ class WPCentral_Worker_Controller {
         $sql_filepath = $temp_dir . '/db_backup.sql';
         $zip_filepath = $temp_dir . '/wp_content_backup.zip';
 
+        $destination = isset($job_data['backup_destination']) ? $job_data['backup_destination'] : 's3';
+
         try {
             // Create temporary workspace
             if (!file_exists($temp_dir)) {
@@ -240,18 +251,38 @@ class WPCentral_Worker_Controller {
             $job_data['progress'] = 70;
             update_option('wp_central_job_' . $job_id, $job_data);
 
-            // Step 3: Upload to S3 using self-contained AWS Sign V4 REST client
-            $this->upload_to_s3_compatible($zip_filepath, $job_data['s3_config']);
+            if ($destination === 's3') {
+                // Step 3: Upload to S3 using self-contained AWS Sign V4 REST client
+                $this->upload_to_s3_compatible($zip_filepath, $job_data['s3_config']);
 
-            // Cleanup workspace
-            $this->recursive_cleanup($temp_dir);
+                // Cleanup workspace zip
+                $this->recursive_cleanup($temp_dir);
+                $final_path = 'S3 Cloud Storage';
+            } else {
+                // Save locally to a secure directory: wp-content/uploads/wp-central-backups/
+                $local_vault = WP_CONTENT_DIR . '/uploads/wp-central-backups';
+                if (!file_exists($local_vault)) {
+                    mkdir($local_vault, 0755, true);
+                }
+
+                $local_archive_name = 'backup_' . $job_id . '.zip';
+                $final_archive_path = $local_vault . '/' . $local_archive_name;
+
+                // Move zip from temp directory to local vault
+                rename($zip_filepath, $final_archive_path);
+
+                // Clean up remaining SQL file and temp folder
+                $this->recursive_cleanup($temp_dir);
+                $final_path = $final_archive_path;
+            }
 
             // Set job to completed
             $job_data['status'] = 'completed';
             $job_data['progress'] = 100;
             $job_data['completed_at'] = time();
             $job_data['archive_name'] = basename($zip_filepath);
-            // Hide sensitive config before final storage
+            $job_data['local_backup_path'] = $final_path;
+
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
 
