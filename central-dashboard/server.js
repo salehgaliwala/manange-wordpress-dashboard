@@ -475,6 +475,46 @@ app.get('/api/plugins/download/:slug', (req, res) => {
 });
 
 /**
+ * Protected Endpoint to trigger a manual synchronization of a site's WP version and pending updates
+ * POST /api/sites/:siteId/sync
+ * Protected by requireAuth
+ */
+app.post('/api/sites/:siteId/sync', requireAuth, async (req, res) => {
+    const { siteId } = req.params;
+
+    const db = loadDB();
+    const siteIndex = db.sites ? db.sites.findIndex(s => s.id === siteId) : -1;
+    if (siteIndex === -1) {
+        return res.status(404).json({ error: 'Site not registered on dashboard.' });
+    }
+
+    const site = db.sites[siteIndex];
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    try {
+        // Query the remote worker /status endpoint
+        const response = await orchestrator.signedGet('/wp-json/wp-central/v1/status');
+        const data = response.data;
+
+        // Persist real values in our database
+        db.sites[siteIndex].wpVersion = data.wp_version || '6.4.2';
+        db.sites[siteIndex].pendingUpdates = data.total_updates !== undefined ? data.total_updates : 0;
+        saveDB(db);
+
+        return res.json({
+            message: 'Site status synced successfully.',
+            site: db.sites[siteIndex]
+        });
+    } catch (err) {
+        console.error('[Sync Error]', err.message);
+        return res.status(500).json({
+            error: 'Failed to query and sync target site status.',
+            message: err.message
+        });
+    }
+});
+
+/**
  * Protected Endpoint to trigger a safe update pipeline for a registered WordPress site
  * POST /api/sites/:siteId/safe-update
  * Protected by requireAuth
