@@ -145,26 +145,54 @@ class WPCentral_Worker_Controller {
      * Return WordPress status, version, and pending updates count
      * GET /wp-json/wp-central/v1/status
      */
-    public function get_wp_status(WP_REST_Request $request) {
-        require_once ABSPATH . 'wp-admin/includes/update.php';
-        $core_updates = get_core_updates();
-        $pending_core = 0;
-        if (!empty($core_updates) && isset($core_updates[0]->response) && $core_updates[0]->response === 'upgrade') {
-            $pending_core = 1;
-        }
+    /**
+ * Return WordPress status, version, and complete pending updates count
+ * GET /wp-json/wp-central/v1/status
+ */
+public function get_wp_status(WP_REST_Request $request) {
+    // 1. Load administrative dependencies required for updates
+    require_once ABSPATH . 'wp-admin/includes/update.php';
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
 
-        require_once ABSPATH . 'wp-admin/includes/plugin.php';
-        $plugin_updates = get_plugin_updates();
-        $pending_plugins = count($plugin_updates);
+    // 2. Clear update transients to force WordPress to fetch fresh data
+    delete_site_transient('update_plugins');
+    delete_site_transient('update_core');
 
-        return new WP_REST_Response(array(
-            'status'          => 'ok',
-            'wp_version'      => get_bloginfo('version'),
-            'pending_core'    => $pending_core,
-            'pending_plugins' => $pending_plugins,
-            'total_updates'   => $pending_core + $pending_plugins
-        ), 200);
+    // 3. Force WordPress to query official repository and fire update hooks
+    wp_version_check([], true);
+    wp_update_plugins();
+
+    // 4. Check Core updates
+    $core_updates = get_core_updates();
+    $pending_core = 0;
+    if (!empty($core_updates) && isset($core_updates[0]->response) && $core_updates[0]->response === 'upgrade') {
+        $pending_core = 1;
     }
+
+    // 5. Retrieve all plugins needing updates
+    $plugin_updates = get_plugin_updates();
+    $pending_plugins = count($plugin_updates);
+
+    // Build itemized list of pending plugins
+    $plugin_list = array();
+    foreach ($plugin_updates as $file => $data) {
+        $plugin_list[] = array(
+            'file'            => $file,
+            'name'            => $data->Name,
+            'current_version' => $data->Version,
+            'new_version'     => isset($data->update->new_version) ? $data->update->new_version : 'Unknown'
+        );
+    }
+
+    return new WP_REST_Response(array(
+        'status'          => 'ok',
+        'wp_version'      => get_bloginfo('version'),
+        'pending_core'    => $pending_core,
+        'pending_plugins' => $pending_plugins,
+        'total_updates'   => $pending_core + $pending_plugins,
+        'plugins_detail'  => $plugin_list
+    ), 200);
+}
 
     /**
      * Initiates non-blocking background backup (supports Local and S3 destinations)

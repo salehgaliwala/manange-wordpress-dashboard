@@ -547,43 +547,37 @@ app.get('/api/jobs/:jobId', requireAuth, (req, res) => {
  * GET /api/sites/:siteId/updates-list
  * Protected by requireAuth
  */
+// Fetch detailed pending updates list dynamically from the target WordPress worker
 app.get('/api/sites/:siteId/updates-list', requireAuth, async (req, res) => {
     const { siteId } = req.params;
     const db = loadDB();
     const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    
     if (!site) {
         return res.status(404).json({ error: 'Site not registered.' });
     }
 
     const orchestrator = new SafeUpdateOrchestrator(site);
     try {
-        // Fetch current version info from target site
         const response = await orchestrator.signedGet('/wp-json/wp-central/v1/status');
         const data = response.data;
 
-        // Populate mock lists of pending plugins if total_updates > 0 to let the user select plugins
-        const plugins = [];
-        if (data.pending_plugins > 0) {
-            plugins.push({ file: 'akismet/akismet.php', name: 'Akismet Anti-Spam', current_version: '5.0', new_version: '5.3' });
-            if (data.pending_plugins > 1) {
-                plugins.push({ file: 'contact-form-7/wp-contact-form-7.php', name: 'Contact Form 7', current_version: '5.8', new_version: '5.9' });
-            }
-        }
+        // Extract real plugin array returned by the updated worker plugin
+        const pendingPlugins = data.plugins_detail || [];
 
         return res.json({
-            wp_version: data.wp_version || '6.4.2',
+            wp_version: data.wp_version || site.wpVersion || '6.4.2',
             pending_core: data.pending_core > 0,
-            pending_plugins: plugins
+            pending_plugins: pendingPlugins
         });
     } catch (err) {
         console.error('[Fetch Updates List Error]', err.message);
-        // Return default values in case of loopback/connection blockages to keep the UI fully responsive and functional
-        return res.json({
-            wp_version: site.wpVersion || '6.4.2',
-            pending_core: site.pendingUpdates > 1,
-            pending_plugins: [
-                { file: 'akismet/akismet.php', name: 'Akismet Anti-Spam', current_version: '5.0', new_version: '5.3' }
-            ]
+        if (err.response) {
+            console.error('Server responded with:', err.response.status, err.response.data);
+        }
+        return res.status(500).json({
+            error: 'Failed to fetch updates list from target site.',
+            message: err.message
         });
     }
 });
