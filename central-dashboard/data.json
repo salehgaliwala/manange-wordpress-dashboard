@@ -13,8 +13,8 @@
       "dashboardBaseUrl": "http://localhost:3002",
       "wpVersion": "6.4.2",
       "pendingUpdates": 2,
-      "lastBackupStatus": "success",
-      "lastBackupTime": "2 hrs ago",
+      "lastBackupStatus": "fail",
+      "lastBackupTime": "Just now (Error)",
       "s3Config": {
         "bucket": "wp-backups-bucket",
         "endpoint": "https://s3.us-east-1.amazonaws.com",
