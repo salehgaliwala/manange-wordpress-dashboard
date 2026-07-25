@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rootline | WordPress operations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar" aria-label="Primary navigation">
+    <a class="brand" href="#overview" aria-label="Rootline home"><span class="brand-mark">R</span><span>rootline</span></a>
+    <div class="workspace-label">Workspace</div>
+    <button class="workspace-switcher" type="button"><span><strong>Northstar group</strong><small>6 connected sites</small></span><span aria-hidden="true">⌄</span></button>
+    <nav class="nav-list">
+      <a class="nav-item active" href="#overview"><span>◈</span>Overview</a>
+      <a class="nav-item" href="#sites"><span>□</span>Sites <b>6</b></a>
+      <a class="nav-item" href="#updates"><span>↻</span>Updates <b class="alert-count">3</b></a>
+      <a class="nav-item" href="#activity"><span>≡</span>Activity</a>
+    </nav>
+    <div class="sidebar-footer">
+      <a class="nav-item" href="#settings"><span>⚙</span>Settings</a>
+      <div class="user-chip"><span class="avatar">AG</span><span><strong>Alex Garcia</strong><small>Administrator</small></span><span class="more">•••</span></div>
+    </div>
+  </aside>
+
+  <main class="main-content" id="overview">
+    <header class="topbar"><div class="breadcrumbs"><span>Workspace</span><i>/</i><strong>Overview</strong></div><div class="top-actions"><button class="icon-button" type="button" aria-label="Search">⌕</button><button class="icon-button" type="button" aria-label="Notifications">♧<span class="notification-dot"></span></button><button class="primary-button" type="button" id="add-site">+ Add site</button></div></header>
+    <section class="page-heading"><div><p class="eyebrow">Thursday, July 23, 2026 <span class="live-dot"></span> All systems operational</p><h1>Good evening, Alex.</h1><p class="lede">A clear view of your WordPress estate, ready when you are.</p></div><button class="date-button" type="button">Last 30 days <span>⌄</span></button></section>
+    <section class="metric-grid" aria-label="Workspace metrics">
+      <article class="metric-card accent-coral"><div class="metric-top"><span>Sites monitored</span><span class="metric-icon">◎</span></div><strong>6</strong><p><em>+1</em> since last month</p></article>
+      <article class="metric-card accent-lime"><div class="metric-top"><span>Healthy sites</span><span class="metric-icon">✓</span></div><strong>5</strong><p><em>83%</em> of your network</p></article>
+      <article class="metric-card accent-blue"><div class="metric-top"><span>Updates pending</span><span class="metric-icon">↻</span></div><strong>12</strong><p><em class="warning">3 critical</em> updates waiting</p></article>
+      <article class="metric-card accent-ink"><div class="metric-top"><span>Uptime average</span><span class="metric-icon">⌁</span></div><strong>99.98<span class="unit">%</span></strong><p><em>+0.04%</em> vs. last period</p></article>
+    </section>
+    <section class="content-grid">
+      <div class="panel sites-panel" id="sites"><div class="panel-heading"><div><p class="eyebrow">Portfolio</p><h2>Your sites</h2></div><button class="text-button" type="button">View all <span>→</span></button></div><div class="site-toolbar"><label class="search-field"><span>⌕</span><input id="site-search" type="search" placeholder="Search sites" aria-label="Search sites"></label><button class="filter-button" type="button">Filter <span>≡</span></button></div><div class="site-list" id="site-list">
+        <div class="site-row" data-site="northstar health"><span class="site-favicon coral">N</span><span class="site-name"><strong>Northstar Health</strong><small>northstarhealth.com</small></span><span class="site-status healthy"><i></i>Healthy</span><span class="site-update">Updated today</span><button class="row-menu" aria-label="Open Northstar Health menu">•••</button></div>
+        <div class="site-row" data-site="field notes"><span class="site-favicon blue">F</span><span class="site-name"><strong>Field Notes</strong><small>fieldnotes.studio</small></span><span class="site-status healthy"><i></i>Healthy</span><span class="site-update">Updated today</span><button class="row-menu" aria-label="Open Field Notes menu">•••</button></div>
+        <div class="site-row" data-site="morrow coffee"><span class="site-favicon yellow">M</span><span class="site-name"><strong>Morrow Coffee</strong><small>morrowcoffee.co</small></span><span class="site-status warning-status"><i></i>Needs attention</span><span class="site-update">2 updates</span><button class="row-menu" aria-label="Open Morrow Coffee menu">•••</button></div>
+        <div class="site-row" data-site="good measure"><span class="site-favicon green">G</span><span class="site-name"><strong>Good Measure</strong><small>goodmeasure.org</small></span><span class="site-status healthy"><i></i>Healthy</span><span class="site-update">Updated yesterday</span><button class="row-menu" aria-label="Open Good Measure menu">•••</button></div>
+      </div></div>
+      <aside class="panel activity-panel" id="activity"><div class="panel-heading"><div><p class="eyebrow">Live feed</p><h2>Recent activity</h2></div><button class="more-button" type="button" aria-label="More activity options">•••</button></div><div class="activity-list"><div class="activity-item"><span class="activity-icon lime">✓</span><p><strong>WordPress updated</strong><span>Field Notes · 18 min ago</span></p></div><div class="activity-item"><span class="activity-icon blue">↻</span><p><strong>Backup completed</strong><span>Northstar Health · 1 hr ago</span></p></div><div class="activity-item"><span class="activity-icon coral">!</span><p><strong>Plugin update available</strong><span>Morrow Coffee · 2 hrs ago</span></p></div><div class="activity-item"><span class="activity-icon ink">+</span><p><strong>New site connected</strong><span>Good Measure · Yesterday</span></p></div></div><button class="activity-link" type="button">See all activity <span>→</span></button></aside>
+    </section>
+    <footer class="status-footer"><span class="live-dot"></span> Last synced 2 minutes ago <span class="footer-divider">·</span> <button type="button">System status</button></footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

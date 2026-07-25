@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Central Worker Plugin
  * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups (to S3 or local disk), automated updates, and custom plugin vault sideloading.
- * Version: 1.2.2
+ * Version: 1.2.3
  * Author: WP Central Team
  * License: GPL2
  */
@@ -20,7 +20,6 @@ class WPCentral_Security {
     public static function get_secret_key() {
         $secret = get_option(self::$secret_key_option_name);
         if (!$secret) {
-            // Fallback for demo or initialization
             $secret = defined('WP_CENTRAL_SECRET_KEY') ? WP_CENTRAL_SECRET_KEY : 'default_secret_key_12345';
         }
         return $secret;
@@ -80,7 +79,6 @@ class WPCentral_Security {
 
         // Store the signature in transient to prevent replay for the duration of its validity (5 minutes)
         set_transient($transient_key, true, 300);
-
         return true;
     }
 
@@ -93,7 +91,7 @@ class WPCentral_Security {
         $data_to_sign = $timestamp . '.' . $body;
         $signature = hash_hmac('sha256', $data_to_sign, $secret_key);
         return array(
-            'X-Timestamp' => $timestamp,
+            'X-Timestamp' => (string)$timestamp,
             'X-Signature' => $signature
         );
     }
@@ -149,7 +147,6 @@ class WPCentral_Worker_Controller {
      */
     public function get_wp_status(WP_REST_Request $request) {
         require_once ABSPATH . 'wp-admin/includes/update.php';
-
         $core_updates = get_core_updates();
         $pending_core = 0;
         if (!empty($core_updates) && isset($core_updates[0]->response) && $core_updates[0]->response === 'upgrade') {
@@ -157,7 +154,6 @@ class WPCentral_Worker_Controller {
         }
 
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
-        $plugins = get_plugins();
         $plugin_updates = get_plugin_updates();
         $pending_plugins = count($plugin_updates);
 
@@ -176,9 +172,7 @@ class WPCentral_Worker_Controller {
      */
     public function handle_backup_initiation(WP_REST_Request $request) {
         $params = $request->get_json_params();
-
         $destination = isset($params['backup_destination']) ? sanitize_text_field($params['backup_destination']) : 's3';
-
         $s3_config = array();
 
         // Validate S3 inputs only if destination is set to cloud S3
@@ -193,7 +187,6 @@ class WPCentral_Worker_Controller {
                     );
                 }
             }
-
             $s3_config = array(
                 'bucket'     => sanitize_text_field($params['s3_bucket']),
                 'endpoint'   => esc_url_raw($params['s3_endpoint']),
@@ -217,36 +210,23 @@ class WPCentral_Worker_Controller {
         );
         update_option('wp_central_job_' . $job_id, $job_data);
 
-        // Multi-Path Loopback Triggering: Fire asynchronous posts to multiple paths to maximize compatibility
         $body = json_encode(array('job_id' => $job_id));
-        $headers = WPCentral_Security::sign_request($body);
-        $headers['Content-Type'] = 'application/json';
-
         $loopback_url = get_rest_url(null, '/wp-central/v1/backup-process');
         $parsed = parse_url($loopback_url);
         $host = isset($parsed['host']) ? $parsed['host'] : 'localhost';
         $port = isset($parsed['port']) ? $parsed['port'] : (isset($_SERVER['SERVER_PORT']) ? $_SERVER['SERVER_PORT'] : '80');
 
-        // Path A: Dynamic Loopback rewrite
-        $internal_url_a = 'http://127.0.0.1';
-        if ($port) {
-            $internal_url_a .= ':' . $port;
-        }
-        $internal_url_a .= isset($parsed['path']) ? $parsed['path'] : '';
+        // Path A: Internal Loopback URL
+        $internal_url_a = 'http://127.0.0.1' . ($port ? ':' . $port : '') . (isset($parsed['path']) ? $parsed['path'] : '');
         if (isset($parsed['query'])) {
             $internal_url_a .= '?' . $parsed['query'];
         }
 
-        $headers_a = $headers;
+        // Dispatch Path A with a unique HMAC signature
+        $headers_a = WPCentral_Security::sign_request($body);
+        $headers_a['Content-Type'] = 'application/json';
         $headers_a['Host'] = $host;
 
-        // Path B: Standard local port 80 loopback
-        $internal_url_b = 'http://127.0.0.1' . (isset($parsed['path']) ? $parsed['path'] : '');
-        if (isset($parsed['query'])) {
-            $internal_url_b .= '?' . $parsed['query'];
-        }
-
-        // Dispatch Path A
         wp_remote_post($internal_url_a, array(
             'blocking'  => false,
             'sslverify' => false,
@@ -255,21 +235,15 @@ class WPCentral_Worker_Controller {
             'body'      => $body
         ));
 
-        // Dispatch Path B
-        wp_remote_post($internal_url_b, array(
-            'blocking'  => false,
-            'sslverify' => false,
-            'timeout'   => 0.1,
-            'headers'   => $headers_a,
-            'body'      => $body
-        ));
+        // Dispatch Path B (Public Endpoint) with its own fresh HMAC signature
+        $headers_b = WPCentral_Security::sign_request($body);
+        $headers_b['Content-Type'] = 'application/json';
 
-        // Dispatch Path C (Public Domain)
         wp_remote_post($loopback_url, array(
             'blocking'  => false,
             'sslverify' => false,
             'timeout'   => 0.1,
-            'headers'   => $headers,
+            'headers'   => $headers_b,
             'body'      => $body
         ));
 
@@ -287,15 +261,12 @@ class WPCentral_Worker_Controller {
     public function handle_background_backup_process(WP_REST_Request $request) {
         $params = $request->get_json_params();
         $job_id = sanitize_text_field($params['job_id']);
-
-        $result = $this->run_backup_process_inline($job_id);
-
+        $this->run_backup_process_inline($job_id);
         return new WP_REST_Response(array('status' => 'finished'), 200);
     }
 
     /**
-     * Core robust backup runner logic. Can be executed asynchronously via loopback,
-     * or synchronously inside get_job_status() as an automatic self-healing fallback if loopback failed.
+     * Core backup runner logic
      */
     private function run_backup_process_inline($job_id) {
         $job_data = get_option('wp_central_job_' . $job_id);
@@ -303,13 +274,11 @@ class WPCentral_Worker_Controller {
             return false;
         }
 
-        // Set limits and status to processing
         set_time_limit(0);
         if (function_exists('ignore_user_abort')) {
             ignore_user_abort(true);
         }
 
-        // Bind custom error/warning to exception handler to capture exact PHP runtime errors
         set_error_handler(function($severity, $message, $file, $line) {
             if (!(error_reporting() & $severity)) {
                 return;
@@ -324,96 +293,65 @@ class WPCentral_Worker_Controller {
         $temp_dir = WP_CONTENT_DIR . '/uploads/wp-central-temp-' . $job_id;
         $sql_filepath = $temp_dir . '/db_backup.sql';
         $zip_filepath = $temp_dir . '/wp_content_backup.zip';
-
         $destination = isset($job_data['backup_destination']) ? $job_data['backup_destination'] : 's3';
 
         try {
-            // Create temporary workspace
             if (!file_exists($temp_dir)) {
                 if (!mkdir($temp_dir, 0755, true)) {
                     throw new Exception("Failed to create temporary folder at: " . $temp_dir);
                 }
             }
 
-            // Step 1: Database Export (Pure PHP SQL Dumper fallback-free/highly-portable)
+            // Step 1: Database Export
             $this->export_database($sql_filepath);
-
             $job_data['progress'] = 40;
             update_option('wp_central_job_' . $job_id, $job_data);
 
-            // Step 2: Zip /wp-content/ directory excluding current temporary workspace
+            // Step 2: Zip /wp-content/ directory
             $this->zip_wp_content($zip_filepath, $sql_filepath, $temp_dir);
-
             $job_data['progress'] = 70;
             update_option('wp_central_job_' . $job_id, $job_data);
 
             if ($destination === 's3') {
-                // Step 3: Upload to S3 using self-contained AWS Sign V4 REST client
+                // Step 3: Upload to S3
                 $this->upload_to_s3_compatible($zip_filepath, $job_data['s3_config']);
-
-                // Cleanup workspace zip
                 $this->recursive_cleanup($temp_dir);
                 $final_path = 'S3 Cloud Storage Bucket: ' . $job_data['s3_config']['bucket'];
             } else {
-                // Save locally to a secure directory: wp-content/uploads/wp-central-backups/
+                // Local Vault destination
                 $local_vault = WP_CONTENT_DIR . '/uploads/wp-central-backups';
                 if (!file_exists($local_vault)) {
                     if (!mkdir($local_vault, 0755, true)) {
                         throw new Exception("Failed to create local backups directory: " . $local_vault);
                     }
                 }
-
                 $local_archive_name = 'backup_' . $job_id . '.zip';
                 $final_archive_path = $local_vault . '/' . $local_archive_name;
 
-                // Move zip from temp directory to local vault
                 if (!rename($zip_filepath, $final_archive_path)) {
                     throw new Exception("Failed to save zip to local backups folder.");
                 }
 
-                // Clean up remaining SQL file and temp folder
                 $this->recursive_cleanup($temp_dir);
                 $final_path = $final_archive_path;
             }
 
-            // Set job to completed
             $job_data['status'] = 'completed';
             $job_data['progress'] = 100;
             $job_data['completed_at'] = time();
             $job_data['archive_name'] = basename($zip_filepath);
             $job_data['local_backup_path'] = $final_path;
-
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
             return true;
-
         } catch (Throwable $e) {
-            // Local cleanup on failure
             $this->recursive_cleanup($temp_dir);
-
-            // Format precise PHP error location and message details
             $formatted_error = sprintf(
                 "PHP Exception: %s inside file %s at line %d",
                 $e->getMessage(),
                 basename($e->getFile()),
                 $e->getLine()
             );
-
-            $job_data['status'] = 'failed';
-            $job_data['error'] = $formatted_error;
-            unset($job_data['s3_config']);
-            update_option('wp_central_job_' . $job_id, $job_data);
-            return false;
-        } catch (Exception $e) {
-            $this->recursive_cleanup($temp_dir);
-
-            $formatted_error = sprintf(
-                "Exception: %s inside file %s at line %d",
-                $e->getMessage(),
-                basename($e->getFile()),
-                $e->getLine()
-            );
-
             $job_data['status'] = 'failed';
             $job_data['error'] = $formatted_error;
             unset($job_data['s3_config']);
@@ -429,242 +367,167 @@ class WPCentral_Worker_Controller {
      * POST /wp-json/wp-central/v1/update
      */
     public function handle_updates(WP_REST_Request $request) {
-        $params = $request->get_json_params();
-        $type = sanitize_text_field($params['type']); // 'core' or 'plugin'
+    // 1. Force higher limits for this thread
+    @ini_set('memory_limit', '512M');
+    @set_time_limit(300);
 
-        // Bind custom error/warning handler to catch exact PHP execution failures (e.g., zip extract, file lock issues)
-        set_error_handler(function($severity, $message, $file, $line) {
-            if (!(error_reporting() & $severity)) {
-                return;
-            }
-            throw new ErrorException($message, 0, $severity, $file, $line);
-        });
-
-        try {
-            // 1. Elevate REST capability privilege context to Administrator programmatically
-            $admin_users = get_users(array('role' => 'Administrator'));
-            $admin_id = (!empty($admin_users)) ? $admin_users[0]->ID : 1;
-            wp_set_current_user($admin_id);
-
-            if (!defined('WP_ADMIN')) {
-                define('WP_ADMIN', true);
-            }
-
-            // Hook direct filesystem method return to override any constraints in wp-config.php
-            add_filter('filesystem_method', function($method) { return 'direct'; }, 9999);
-
-            // Load complete WordPress administrative upgrader utilities
-            require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-            require_once ABSPATH . 'wp-admin/includes/plugin.php';
-            require_once ABSPATH . 'wp-admin/includes/theme.php';
-            require_once ABSPATH . 'wp-admin/includes/admin.php';
-            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-            require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
-            require_once ABSPATH . 'wp-admin/includes/update.php';
-
-            // Ensure '/wp-content/upgrade/' directory exists for unpack workspace
-            $upgrade_dir = WP_CONTENT_DIR . '/upgrade';
-            if (!file_exists($upgrade_dir)) {
-                @mkdir($upgrade_dir, 0755, true);
-            }
-
-            // Initialize WordPress Filesystem API to prevent silent file write failures
-            global $wp_filesystem;
-            if (empty($wp_filesystem)) {
-                ob_start();
-                $creds = request_filesystem_credentials('', '', false, false, null);
+    // 2. Register shutdown function to catch silent fatal crashes
+    register_shutdown_function(function() {
+        $error = error_get_last();
+        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+            if (ob_get_length()) {
                 ob_end_clean();
-                if (!WP_Filesystem($creds)) {
-                    if (!defined('FS_METHOD')) {
-                        define('FS_METHOD', 'direct');
-                    }
-                    WP_Filesystem();
-                }
             }
+            header('Content-Type: application/json', true, 500);
+            echo json_encode([
+                'status'  => 'error',
+                'message' => sprintf('Fatal PHP Error: %s in %s on line %d', $error['message'], basename($error['file']), $error['line'])
+            ]);
+            exit;
+        }
+    });
 
-            // Force FS_METHOD 'direct' to bypass prompt credentials
-            if (!defined('FS_METHOD')) {
-                define('FS_METHOD', 'direct');
-            }
-            add_filter('request_filesystem_credentials', '__return_true', 100);
+    $params = $request->get_json_params();
+    $type = sanitize_text_field($params['type']);
 
-            // Suppress any output/skin prints to prevent REST JSON response corruption
+    try {
+        $admin_users = get_users(['role' => 'Administrator']);
+        $admin_id = (!empty($admin_users)) ? $admin_users[0]->ID : 1;
+        wp_set_current_user($admin_id);
+
+        if (!defined('WP_ADMIN')) {
+            define('WP_ADMIN', true);
+        }
+
+        add_filter('filesystem_method', function() { return 'direct'; }, 9999);
+
+        // Load WordPress Upgrader Dependencies explicitly
+        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        require_once ABSPATH . 'wp-admin/includes/class-automatic-upgrader-skin.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/theme.php';
+        require_once ABSPATH . 'wp-admin/includes/admin.php';
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+        require_once ABSPATH . 'wp-admin/includes/update.php';
+
+        global $wp_filesystem;
+        if (empty($wp_filesystem)) {
             ob_start();
-
-            if ($type === 'core') {
-                // Force WP version check to populate update transients
-                wp_version_check();
-
-                $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
-                $updates = get_core_updates();
-
-                if (empty($updates)) {
-                    ob_end_clean();
-                    restore_error_handler();
-                    return new WP_REST_Response(array(
-                        'status'  => 'success',
-                        'message' => 'WordPress Core is already up to date.'
-                    ), 200);
+            $creds = request_filesystem_credentials('', '', false, false, null);
+            ob_end_clean();
+            if (!WP_Filesystem($creds)) {
+                if (!defined('FS_METHOD')) {
+                    define('FS_METHOD', 'direct');
                 }
+                WP_Filesystem();
+            }
+        }
 
-                $result = $upgrader->upgrade($updates[0]);
-                ob_end_clean();
+        if ($type === 'core') {
+            wp_version_check();
+            $updates = get_core_updates();
 
-                if (is_wp_error($result)) {
-                    restore_error_handler();
-                    return new WP_REST_Response(array(
-                        'status'  => 'error',
-                        'message' => 'Upgrader Error: ' . $result->get_error_message()
-                    ), 500);
-                }
-
-                restore_error_handler();
-                return new WP_REST_Response(array(
+            if (empty($updates) || !isset($updates[0]->response) || $updates[0]->response !== 'upgrade') {
+                return new WP_REST_Response([
                     'status'  => 'success',
-                    'message' => 'WordPress Core updated successfully.',
-                    'result'  => $result
-                ), 200);
+                    'message' => 'WordPress Core is already up to date.'
+                ], 200);
+            }
 
-            } elseif ($type === 'plugin') {
-                $plugins = $params['plugins']; // Array of strings or objects: e.g., [{"file": "akismet/akismet.php", "package_url": "..."}]
-                if (empty($plugins) || !is_array($plugins)) {
-                    ob_end_clean();
-                    restore_error_handler();
-                    return new WP_REST_Response(array(
-                        'status'  => 'error',
-                        'message' => 'A valid list of plugins must be provided.'
-                    ), 400);
-                }
+            $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
+            $result = $upgrader->upgrade($updates[0]);
 
-                // Force WP to check available plugin updates and populate transients
-                wp_update_plugins();
+            if (is_wp_error($result)) {
+                return new WP_REST_Response([
+                    'status'  => 'error',
+                    'message' => 'Upgrader Error: ' . $result->get_error_message()
+                ], 500);
+            }
 
-                $standard_upgrades = array();
-                $custom_upgrades_results = array();
+            return new WP_REST_Response([
+                'status'  => 'success',
+                'message' => 'WordPress Core updated successfully.'
+            ], 200);
 
-                // Initialize Plugin Upgrader with silent automatic skin
-                $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
+        } elseif ($type === 'plugin') {
+            $plugins = $params['plugins'];
+            if (empty($plugins) || !is_array($plugins)) {
+                return new WP_REST_Response([
+                    'status'  => 'error',
+                    'message' => 'A valid list of plugins must be provided.'
+                ], 400);
+            }
 
-                foreach ($plugins as $plugin_item) {
-                    $plugin_file = '';
-                    $package_url = '';
+            wp_update_plugins();
+            $standard_upgrades = [];
+            $custom_upgrades_results = [];
+            $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
 
-                    // Handle both simple formats (string) and custom vault formats (object)
-                    if (is_string($plugin_item)) {
-                        $plugin_file = sanitize_text_field($plugin_item);
-                    } elseif (is_array($plugin_item)) {
-                        $plugin_file = isset($plugin_item['file']) ? sanitize_text_field($plugin_item['file']) : '';
-                        $package_url = isset($plugin_item['package_url']) ? esc_url_raw($plugin_item['package_url']) : '';
-                    }
+            foreach ($plugins as $plugin_item) {
+                $plugin_file = is_string($plugin_item) ? sanitize_text_field($plugin_item) : (isset($plugin_item['file']) ? sanitize_text_field($plugin_item['file']) : '');
+                $package_url = is_array($plugin_item) && isset($plugin_item['package_url']) ? esc_url_raw($plugin_item['package_url']) : '';
 
-                    if (empty($plugin_file)) {
+                if (empty($plugin_file)) continue;
+
+                if (!empty($package_url)) {
+                    $download_result = download_url($package_url);
+                    if (is_wp_error($download_result)) {
+                        $custom_upgrades_results[$plugin_file] = [
+                            'status'  => 'error',
+                            'message' => 'Download failed: ' . $download_result->get_error_message()
+                        ];
                         continue;
                     }
 
-                    // If package_url is present, this is a premium/custom plugin sideload!
-                    if (!empty($package_url)) {
-                        $download_result = download_url($package_url);
+                    $install_result = $upgrader->install($download_result, ['overwrite_package' => true]);
 
-                        if (is_wp_error($download_result)) {
-                            $custom_upgrades_results[$plugin_file] = array(
-                                'status'  => 'error',
-                                'message' => 'Failed to download custom package zip: ' . $download_result->get_error_message()
-                            );
-                            continue;
-                        }
-
-                        // Trigger direct local zip installation/overwrite
-                        $install_result = $upgrader->install($download_result, array('overwrite_package' => true));
-
-                        // Secure local cleanup of temporary download archive
-                        if (file_exists($download_result)) {
-                            @unlink($download_result);
-                        }
-
-                        if (is_wp_error($install_result)) {
-                            $custom_upgrades_results[$plugin_file] = array(
-                                'status'  => 'error',
-                                'message' => $install_result->get_error_message()
-                            );
-                        } else {
-                            $custom_upgrades_results[$plugin_file] = array(
-                                'status'  => 'success',
-                                'message' => 'Sideloaded premium plugin updated successfully.'
-                            );
-                        }
-                    } else {
-                        // Standard public WordPress.org repository plugin
-                        $standard_upgrades[] = $plugin_file;
+                    if (file_exists($download_result)) {
+                        @unlink($download_result);
                     }
+
+                    $custom_upgrades_results[$plugin_file] = is_wp_error($install_result) ? [
+                        'status'  => 'error',
+                        'message' => $install_result->get_error_message()
+                    ] : [
+                        'status'  => 'success',
+                        'message' => 'Plugin updated successfully.'
+                    ];
+                } else {
+                    $standard_upgrades[] = $plugin_file;
                 }
-
-                // Run standard public bulk upgrades
-                $standard_results = null;
-                if (!empty($standard_upgrades)) {
-                    $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
-                }
-
-                // Flush plugins cache and delete site transients so WP Admin reflects the updated values immediately
-                wp_clean_plugins_cache(true);
-                delete_site_transient('update_plugins');
-
-                ob_end_clean();
-                restore_error_handler();
-
-                return new WP_REST_Response(array(
-                    'status'           => 'success',
-                    'message'          => 'Plugins update operation completed.',
-                    'custom_results'   => $custom_upgrades_results,
-                    'standard_results' => $standard_results
-                ), 200);
             }
 
-            ob_end_clean();
-            restore_error_handler();
+            $standard_results = null;
+            if (!empty($standard_upgrades)) {
+                $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
+            }
 
-            return new WP_REST_Response(array(
-                'status'  => 'error',
-                'message' => 'Invalid update type specified.'
-            ), 400);
+            wp_clean_plugins_cache(true);
+            delete_site_transient('update_plugins');
 
-        } catch (Throwable $e) {
-            @ob_end_clean();
-            restore_error_handler();
-
-            $formatted_error = sprintf(
-                "PHP Exception during update: %s inside file %s at line %d",
-                $e->getMessage(),
-                basename($e->getFile()),
-                $e->getLine()
-            );
-
-            return new WP_REST_Response(array(
-                'status'  => 'error',
-                'message' => $formatted_error
-            ), 500);
-        } catch (Exception $e) {
-            @ob_end_clean();
-            restore_error_handler();
-
-            $formatted_error = sprintf(
-                "Exception during update: %s inside file %s at line %d",
-                $e->getMessage(),
-                basename($e->getFile()),
-                $e->getLine()
-            );
-
-            return new WP_REST_Response(array(
-                'status'  => 'error',
-                'message' => $formatted_error
-            ), 500);
+            return new WP_REST_Response([
+                'status'           => 'success',
+                'message'          => 'Plugins update operation completed.',
+                'custom_results'   => $custom_upgrades_results,
+                'standard_results' => $standard_results
+            ], 200);
         }
+
+        return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid update type.'], 400);
+
+    } catch (Throwable $e) {
+        return new WP_REST_Response([
+            'status'  => 'error',
+            'message' => sprintf('Exception: %s inside %s:%d', $e->getMessage(), basename($e->getFile()), $e->getLine())
+        ], 500);
     }
+}
 
     /**
      * Poll status endpoint for asynchronous jobs
      * GET /wp-json/wp-central/v1/job-status
-     * Includes automated Self-Healing inline-execution fallback if the job remains pending!
      */
     public function get_job_status(WP_REST_Request $request) {
         $job_id = sanitize_text_field($request->get_param('job_id'));
@@ -685,10 +548,8 @@ class WPCentral_Worker_Controller {
             );
         }
 
-        // SELF-HEALING FALLBACK: If loopback was blocked and task remained pending > 5 seconds, execute synchronously inline!
         if ($job_data['status'] === 'pending' && (time() - intval($job_data['created_at'])) > 5) {
             $this->run_backup_process_inline($job_id);
-            // Reload the updated state
             $job_data = get_option('wp_central_job_' . $job_id);
         }
 
@@ -696,84 +557,87 @@ class WPCentral_Worker_Controller {
     }
 
     /**
-     * Pure PHP robust database dumper
+     * Database Dumper
      */
-    private function export_database($filepath) {
-        global $wpdb;
-        $tables = $wpdb->get_col("SHOW TABLES");
-        $sql_content = "-- WP Central Database Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n\n";
-
-        foreach ($tables as $table) {
-            $create_table = $wpdb->get_row("SHOW CREATE TABLE `$table`", ARRAY_N);
-            $sql_content .= "DROP TABLE IF EXISTS `$table`;\n";
-            $sql_content .= $create_table[1] . ";\n\n";
-
-            $rows = $wpdb->get_results("SELECT * FROM `$table`", ARRAY_A);
-            foreach ($rows as $row) {
-                $escaped_values = array();
-                foreach ($row as $val) {
-                    if (is_null($val)) {
-                        $escaped_values[] = 'NULL';
-                    } else {
-                        $escaped_values[] = "'" . esc_sql($val) . "'";
-                    }
-                }
-                $keys = array_map(function($k) { return "`$k`"; }, array_keys($row));
-                $sql_content .= "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES (" . implode(', ', $escaped_values) . ");\n";
-            }
-            $sql_content .= "\n\n";
-        }
-
-        if (file_put_contents($filepath, $sql_content) === false) {
-            throw new Exception("Unable to write SQL database backup file.");
-        }
+   private function export_database($filepath) {
+    global $wpdb;
+    $tables = $wpdb->get_col("SHOW TABLES");
+    $handle = fopen($filepath, 'w');
+    if (!$handle) {
+        throw new Exception("Unable to open SQL file for writing at: " . $filepath);
     }
 
+    fwrite($handle, "-- WP Central Database Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n\n");
+
+    foreach ($tables as $table) {
+        $create_table = $wpdb->get_row("SHOW CREATE TABLE `$table`", ARRAY_N);
+        fwrite($handle, "DROP TABLE IF EXISTS `$table`;\n" . $create_table[1] . ";\n\n");
+
+        $count = $wpdb->get_var("SELECT COUNT(*) FROM `$table`");
+        $chunk_size = 500;
+
+        for ($offset = 0; $offset < $count; $offset += $chunk_size) {
+            $rows = $wpdb->get_results("SELECT * FROM `$table` LIMIT $chunk_size OFFSET $offset", ARRAY_A);
+            foreach ($rows as $row) {
+                $escaped_values = array_map(function($val) {
+                    return is_null($val) ? 'NULL' : "'" . esc_sql($val) . "'";
+                }, array_values($row));
+                
+                $keys = array_map(function($k) { return "`$k`"; }, array_keys($row));
+                fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES (" . implode(', ', $escaped_values) . ");\n");
+            }
+        }
+        fwrite($handle, "\n\n");
+    }
+    fclose($handle);
+}
+
     /**
-     * Zip recursive worker excluding specific workspace path
+     * Zip recursive worker excluding workspace directory
      */
     private function zip_wp_content($zip_filepath, $sql_filepath, $exclude_dir) {
-        $zip = new ZipArchive();
-        if ($zip->open($zip_filepath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-            throw new Exception("Could not create ZIP archive at: " . $zip_filepath);
-        }
-
-        $wp_content_dir = rtrim(WP_CONTENT_DIR, '/\\');
-        $files = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
-            RecursiveIteratorIterator::LEAVES_ONLY
-        );
-
-        foreach ($files as $file) {
-            if (!$file->isDir()) {
-                $real_path = $file->getRealPath();
-
-                // Exclude temporary directory to prevent recursive loop nesting
-                if (strpos($real_path, $exclude_dir) === 0) {
-                    continue;
-                }
-
-                // Skip non-readable files (permission blocks) gracefully to prevent incomplete archive generations
-                if (!is_readable($real_path)) {
-                    continue;
-                }
-
-                try {
-                    $relative_path = substr($real_path, strlen($wp_content_dir) + 1);
-                    $zip->addFile($real_path, 'wp-content/' . $relative_path);
-                } catch (Exception $e) {
-                    // Gracefully skip single file error
-                }
-            }
-        }
-
-        // Add the SQL database backup into the root of the archive
-        $zip->addFile($sql_filepath, 'database_dump.sql');
-        $zip->close();
+    if (!class_exists('ZipArchive')) {
+        throw new Exception("ZipArchive PHP extension is not installed on this server.");
     }
 
+    $zip = new ZipArchive();
+    if ($zip->open($zip_filepath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        throw new Exception("Could not create ZIP archive at: " . $zip_filepath);
+    }
+
+    $wp_content_dir = wp_normalize_path(rtrim(WP_CONTENT_DIR, '/\\'));
+    $norm_exclude_dir = wp_normalize_path($exclude_dir);
+    $norm_backups_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
+
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    foreach ($files as $file) {
+        if (!$file->isDir()) {
+            $real_path = wp_normalize_path($file->getRealPath());
+
+            // Skip current temp directory and local backup vault
+            if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0)) {
+                continue;
+            }
+
+            if (!is_readable($real_path)) {
+                continue;
+            }
+
+            $relative_path = substr($real_path, strlen($wp_content_dir) + 1);
+            $zip->addFile($real_path, 'wp-content/' . $relative_path);
+        }
+    }
+
+    $zip->addFile($sql_filepath, 'database_dump.sql');
+    $zip->close();
+}
+
     /**
-     * Lightweight AWS Signature V4 S3 compatibility REST client
+     * AWS Signature V4 S3 client
      */
     private function upload_to_s3_compatible($filepath, $s3_config) {
         $bucket = $s3_config['bucket'];
@@ -793,7 +657,6 @@ class WPCentral_Worker_Controller {
         $timestamp = gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
 
-        // Canonical structures for Signature V4
         $request_uri = '/' . $bucket . '/' . $object_name;
         $request_url = $endpoint . '/' . $bucket . '/' . $object_name;
 
@@ -804,15 +667,13 @@ class WPCentral_Worker_Controller {
             'x-amz-date'           => $timestamp,
         );
 
-        // Sort headers alphabetically
         ksort($headers);
-
         $canonical_headers = '';
         foreach ($headers as $k => $v) {
             $canonical_headers .= $k . ':' . trim($v) . "\n";
         }
-        $signed_headers = implode(';', array_keys($headers));
 
+        $signed_headers = implode(';', array_keys($headers));
         $canonical_request = "PUT\n" .
                              $request_uri . "\n" .
                              "" . "\n" .
@@ -827,16 +688,14 @@ class WPCentral_Worker_Controller {
                           $credential_scope . "\n" .
                           hash('sha256', $canonical_request);
 
-        // Compute signing keys
         $k_date = hash_hmac('sha256', $date, 'AWS4' . $secret_key, true);
         $k_region = hash_hmac('sha256', $region, $k_date, true);
         $k_service = hash_hmac('sha256', 's3', $k_region, true);
         $k_signing = hash_hmac('sha256', 'aws4_request', $k_service, true);
-
         $signature = hash_hmac('sha256', $string_to_sign, $k_signing);
+
         $authorization = "$algorithm Credential=$access_key/$credential_scope, SignedHeaders=$signed_headers, Signature=$signature";
 
-        // Assemble request arguments
         $args = array(
             'method'    => 'PUT',
             'headers'   => array(
@@ -847,11 +706,12 @@ class WPCentral_Worker_Controller {
                 'Authorization'        => $authorization
             ),
             'body'      => $file_content,
-            'timeout'   => 600, // Generous timeout for large archive streams
+            'timeout'   => 600,
             'sslverify' => false
         );
 
         $response = wp_remote_request($request_url, $args);
+
         if (is_wp_error($response)) {
             throw new Exception("S3 Transmission Error: " . $response->get_error_message());
         }
@@ -865,14 +725,10 @@ class WPCentral_Worker_Controller {
         return true;
     }
 
-    /**
-     * Recursively delete folder and files
-     */
     private function recursive_cleanup($dir) {
         if (!file_exists($dir)) {
             return;
         }
-
         $files = array_diff(scandir($dir), array('.', '..'));
         foreach ($files as $file) {
             $path = $dir . '/' . $file;
@@ -886,5 +742,4 @@ class WPCentral_Worker_Controller {
     }
 }
 
-// Instantiate core plugin controller
 new WPCentral_Worker_Controller();
