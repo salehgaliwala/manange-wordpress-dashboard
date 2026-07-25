@@ -66,7 +66,7 @@ class SafeUpdateOrchestrator {
     /**
      * Poll Job Status on Worker Plugin until backup process completes or fails.
      */
-    async pollBackupStatus(jobId, intervalMs = 5000, timeoutMs = 600000) {
+    async pollBackupStatus(jobId, onStep, intervalMs = 2500, timeoutMs = 600000) {
         console.log(`[Backup Poller] Polling status for job: ${jobId}`);
         const startTime = Date.now();
 
@@ -75,6 +75,16 @@ class SafeUpdateOrchestrator {
                 const response = await this.signedGet('/wp-json/wp-central/v1/job-status', { job_id: jobId });
                 const job = response.data;
                 console.log(`[Backup Poller] Status: ${job.status}, Progress: ${job.progress}%`);
+
+                if (onStep) {
+                    // Map the 0-100% remote progress to a 25-70% dashboard progress slice
+                    const dashboardProgress = Math.round(25 + (job.progress * 0.45));
+                    let stepMsg = `Exporting databases and archiving entire /wp-content/ directory (${job.progress}%)...`;
+                    if (job.status === 'completed') {
+                        stepMsg = `Securing archive to final destination...`;
+                    }
+                    onStep(dashboardProgress, stepMsg);
+                }
 
                 if (job.status === 'completed') {
                     return job;
@@ -121,13 +131,18 @@ class SafeUpdateOrchestrator {
      * Performs an automated update sequence with pre-update backup step.
      *
      * @param {Object} updateParams Update payload, e.g., { type: 'plugin', plugins: ['akismet/akismet.php'] }
+     * @param {Function} [onStep] Progress callback function
      */
-    async executeSafeUpdate(updateParams) {
+    async executeSafeUpdate(updateParams, onStep) {
         console.log('\n=== Starting Safe Update Pipeline ===');
 
         try {
+            if (onStep) onStep(10, 'Initializing Pipeline Connection...');
+
             // STEP A: Trigger asynchronous backup on the remote plugin and poll for completion
             console.log('\n--- Step A: Triggering Remote Backup ---');
+            if (onStep) onStep(20, 'Triggering target backup execution on target...');
+
             const backupPayload = {
                 backup_destination: updateParams.backup_destination || 's3',
                 s3_bucket: this.s3Config.bucket,
@@ -141,12 +156,15 @@ class SafeUpdateOrchestrator {
             const { job_id } = backupInitResponse.data;
             console.log(`Backup accepted. Received Job ID: ${job_id}`);
 
-            // Wait for non-blocking backup to upload to S3 successfully
-            await this.pollBackupStatus(job_id);
+            // Wait for non-blocking backup to upload successfully
+            const backupJob = await this.pollBackupStatus(job_id, onStep);
             console.log('✓ Step A Completed. Backup created successfully.');
+
+            if (onStep) onStep(75, 'Securing archive and preparing update payload...');
 
             // STEP B: Perform the update (Modifying payload for custom plugin vault matches)
             console.log('\n--- Step B: Dispatching Automated Core / Plugin Updates ---');
+            if (onStep) onStep(85, 'Dispatching direct Core / Plugin update upgrader routines...');
 
             let finalUpdatePayload = { ...updateParams };
 
@@ -189,12 +207,15 @@ class SafeUpdateOrchestrator {
 
             const updateResponse = await this.signedPost('/wp-json/wp-central/v1/update', finalUpdatePayload);
             console.log(`Update Result Message: ${updateResponse.data.message}`);
+
+            if (onStep) onStep(100, `✓ Pipeline complete! Node updated directly and safely.`);
             console.log('✓ Step B Completed.');
 
             console.log('\n✓ Automated Update Pipeline finished successfully!');
             return {
                 success: true,
-                message: updateResponse.data.message
+                message: updateResponse.data.message,
+                backup_path: backupJob.local_backup_path || backupJob.archive_name || 'Cloud S3 Bucket'
             };
 
         } catch (error) {
@@ -202,6 +223,7 @@ class SafeUpdateOrchestrator {
             if (error.response) {
                 console.error('Server responded with:', error.response.status, error.response.data);
             }
+            if (onStep) onStep(0, `⚠️ Pipeline failed: ${error.message}`);
             throw error;
         }
     }
