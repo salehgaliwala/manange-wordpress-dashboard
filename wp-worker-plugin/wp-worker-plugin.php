@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Central Worker Plugin
  * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups (to S3 or local disk), automated updates, and custom plugin vault sideloading.
- * Version: 1.2.1
+ * Version: 1.2.2
  * Author: WP Central Team
  * License: GPL2
  */
@@ -217,30 +217,55 @@ class WPCentral_Worker_Controller {
         );
         update_option('wp_central_job_' . $job_id, $job_data);
 
-        // Trigger Asynchronous loopback request to run the backup process non-blocking
-        $loopback_url = get_rest_url(null, '/wp-central/v1/backup-process');
+        // Multi-Path Loopback Triggering: Fire asynchronous posts to multiple paths to maximize compatibility
+        $body = json_encode(array('job_id' => $job_id));
+        $headers = WPCentral_Security::sign_request($body);
+        $headers['Content-Type'] = 'application/json';
 
-        // Bypassing Docker Port-mapping/Firewall: Dynamically rewrite loopback URL to local 127.0.0.1 internally
+        $loopback_url = get_rest_url(null, '/wp-central/v1/backup-process');
         $parsed = parse_url($loopback_url);
         $host = isset($parsed['host']) ? $parsed['host'] : 'localhost';
         $port = isset($parsed['port']) ? $parsed['port'] : (isset($_SERVER['SERVER_PORT']) ? $_SERVER['SERVER_PORT'] : '80');
 
-        $internal_url = 'http://127.0.0.1';
+        // Path A: Dynamic Loopback rewrite
+        $internal_url_a = 'http://127.0.0.1';
         if ($port) {
-            $internal_url .= ':' . $port;
+            $internal_url_a .= ':' . $port;
         }
-        $internal_url .= isset($parsed['path']) ? $parsed['path'] : '';
+        $internal_url_a .= isset($parsed['path']) ? $parsed['path'] : '';
         if (isset($parsed['query'])) {
-            $internal_url .= '?' . $parsed['query'];
+            $internal_url_a .= '?' . $parsed['query'];
         }
 
-        $body = json_encode(array('job_id' => $job_id));
-        $headers = WPCentral_Security::sign_request($body);
-        $headers['Content-Type'] = 'application/json';
-        $headers['Host'] = $host; // Pass the original Host name so the web server routes correctly!
+        $headers_a = $headers;
+        $headers_a['Host'] = $host;
 
-        // Fire and forget: very low timeout and blocking false ensures instant response
-        wp_remote_post($internal_url, array(
+        // Path B: Standard local port 80 loopback
+        $internal_url_b = 'http://127.0.0.1' . (isset($parsed['path']) ? $parsed['path'] : '');
+        if (isset($parsed['query'])) {
+            $internal_url_b .= '?' . $parsed['query'];
+        }
+
+        // Dispatch Path A
+        wp_remote_post($internal_url_a, array(
+            'blocking'  => false,
+            'sslverify' => false,
+            'timeout'   => 0.1,
+            'headers'   => $headers_a,
+            'body'      => $body
+        ));
+
+        // Dispatch Path B
+        wp_remote_post($internal_url_b, array(
+            'blocking'  => false,
+            'sslverify' => false,
+            'timeout'   => 0.1,
+            'headers'   => $headers_a,
+            'body'      => $body
+        ));
+
+        // Dispatch Path C (Public Domain)
+        wp_remote_post($loopback_url, array(
             'blocking'  => false,
             'sslverify' => false,
             'timeout'   => 0.1,
@@ -263,14 +288,26 @@ class WPCentral_Worker_Controller {
         $params = $request->get_json_params();
         $job_id = sanitize_text_field($params['job_id']);
 
+        $result = $this->run_backup_process_inline($job_id);
+
+        return new WP_REST_Response(array('status' => 'finished'), 200);
+    }
+
+    /**
+     * Core robust backup runner logic. Can be executed asynchronously via loopback,
+     * or synchronously inside get_job_status() as an automatic self-healing fallback if loopback failed.
+     */
+    private function run_backup_process_inline($job_id) {
         $job_data = get_option('wp_central_job_' . $job_id);
-        if (!$job_data || $job_data['status'] !== 'pending') {
-            return new WP_REST_Response(array('status' => 'ignored'), 200);
+        if (!$job_data || ($job_data['status'] !== 'pending' && $job_data['status'] !== 'processing')) {
+            return false;
         }
 
         // Set limits and status to processing
         set_time_limit(0);
-        ignore_user_abort(true);
+        if (function_exists('ignore_user_abort')) {
+            ignore_user_abort(true);
+        }
 
         // Bind custom error/warning to exception handler to capture exact PHP runtime errors
         set_error_handler(function($severity, $message, $file, $line) {
@@ -348,6 +385,7 @@ class WPCentral_Worker_Controller {
 
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
+            return true;
 
         } catch (Throwable $e) {
             // Local cleanup on failure
@@ -365,6 +403,7 @@ class WPCentral_Worker_Controller {
             $job_data['error'] = $formatted_error;
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
+            return false;
         } catch (Exception $e) {
             $this->recursive_cleanup($temp_dir);
 
@@ -379,11 +418,10 @@ class WPCentral_Worker_Controller {
             $job_data['error'] = $formatted_error;
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
+            return false;
         } finally {
             restore_error_handler();
         }
-
-        return new WP_REST_Response(array('status' => 'finished'), 200);
     }
 
     /**
@@ -626,6 +664,7 @@ class WPCentral_Worker_Controller {
     /**
      * Poll status endpoint for asynchronous jobs
      * GET /wp-json/wp-central/v1/job-status
+     * Includes automated Self-Healing inline-execution fallback if the job remains pending!
      */
     public function get_job_status(WP_REST_Request $request) {
         $job_id = sanitize_text_field($request->get_param('job_id'));
@@ -644,6 +683,13 @@ class WPCentral_Worker_Controller {
                 __('The specified background job was not found.', 'wp-central'),
                 array('status' => 404)
             );
+        }
+
+        // SELF-HEALING FALLBACK: If loopback was blocked and task remained pending > 5 seconds, execute synchronously inline!
+        if ($job_data['status'] === 'pending' && (time() - intval($job_data['created_at'])) > 5) {
+            $this->run_backup_process_inline($job_id);
+            // Reload the updated state
+            $job_data = get_option('wp_central_job_' . $job_id);
         }
 
         return new WP_REST_Response($job_data, 200);
