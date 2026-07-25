@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Central Worker Plugin
  * Description: Lightweight WordPress worker plugin for Central WordPress Management System. Supports secure HMAC-SHA256 authentication, asynchronous backups (to S3 or local disk), automated updates, and custom plugin vault sideloading.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: WP Central Team
  * License: GPL2
  */
@@ -272,6 +272,14 @@ class WPCentral_Worker_Controller {
         set_time_limit(0);
         ignore_user_abort(true);
 
+        // Bind custom error/warning to exception handler to capture exact PHP runtime errors
+        set_error_handler(function($severity, $message, $file, $line) {
+            if (!(error_reporting() & $severity)) {
+                return;
+            }
+            throw new ErrorException($message, 0, $severity, $file, $line);
+        });
+
         $job_data['status'] = 'processing';
         $job_data['progress'] = 10;
         update_option('wp_central_job_' . $job_id, $job_data);
@@ -285,7 +293,9 @@ class WPCentral_Worker_Controller {
         try {
             // Create temporary workspace
             if (!file_exists($temp_dir)) {
-                mkdir($temp_dir, 0755, true);
+                if (!mkdir($temp_dir, 0755, true)) {
+                    throw new Exception("Failed to create temporary folder at: " . $temp_dir);
+                }
             }
 
             // Step 1: Database Export (Pure PHP SQL Dumper fallback-free/highly-portable)
@@ -311,14 +321,18 @@ class WPCentral_Worker_Controller {
                 // Save locally to a secure directory: wp-content/uploads/wp-central-backups/
                 $local_vault = WP_CONTENT_DIR . '/uploads/wp-central-backups';
                 if (!file_exists($local_vault)) {
-                    mkdir($local_vault, 0755, true);
+                    if (!mkdir($local_vault, 0755, true)) {
+                        throw new Exception("Failed to create local backups directory: " . $local_vault);
+                    }
                 }
 
                 $local_archive_name = 'backup_' . $job_id . '.zip';
                 $final_archive_path = $local_vault . '/' . $local_archive_name;
 
                 // Move zip from temp directory to local vault
-                rename($zip_filepath, $final_archive_path);
+                if (!rename($zip_filepath, $final_archive_path)) {
+                    throw new Exception("Failed to save zip to local backups folder.");
+                }
 
                 // Clean up remaining SQL file and temp folder
                 $this->recursive_cleanup($temp_dir);
@@ -335,14 +349,38 @@ class WPCentral_Worker_Controller {
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
 
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             // Local cleanup on failure
             $this->recursive_cleanup($temp_dir);
 
+            // Format precise PHP error location and message details
+            $formatted_error = sprintf(
+                "PHP Exception: %s inside file %s at line %d",
+                $e->getMessage(),
+                basename($e->getFile()),
+                $e->getLine()
+            );
+
             $job_data['status'] = 'failed';
-            $job_data['error'] = $e->getMessage();
+            $job_data['error'] = $formatted_error;
             unset($job_data['s3_config']);
             update_option('wp_central_job_' . $job_id, $job_data);
+        } catch (Exception $e) {
+            $this->recursive_cleanup($temp_dir);
+
+            $formatted_error = sprintf(
+                "Exception: %s inside file %s at line %d",
+                $e->getMessage(),
+                basename($e->getFile()),
+                $e->getLine()
+            );
+
+            $job_data['status'] = 'failed';
+            $job_data['error'] = $formatted_error;
+            unset($job_data['s3_config']);
+            update_option('wp_central_job_' . $job_id, $job_data);
+        } finally {
+            restore_error_handler();
         }
 
         return new WP_REST_Response(array('status' => 'finished'), 200);
@@ -356,186 +394,233 @@ class WPCentral_Worker_Controller {
         $params = $request->get_json_params();
         $type = sanitize_text_field($params['type']); // 'core' or 'plugin'
 
-        // 1. Elevate REST capability privilege context to Administrator programmatically
-        $admin_users = get_users(array('role' => 'Administrator'));
-        $admin_id = (!empty($admin_users)) ? $admin_users[0]->ID : 1;
-        wp_set_current_user($admin_id);
-
-        if (!defined('WP_ADMIN')) {
-            define('WP_ADMIN', true);
-        }
-
-        // Hook direct filesystem method return to override any constraints in wp-config.php
-        add_filter('filesystem_method', function($method) { return 'direct'; }, 9999);
-
-        // Load complete WordPress administrative upgrader utilities
-        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
-        require_once ABSPATH . 'wp-admin/includes/file.php';
-        require_once ABSPATH . 'wp-admin/includes/plugin.php';
-        require_once ABSPATH . 'wp-admin/includes/theme.php';
-        require_once ABSPATH . 'wp-admin/includes/admin.php';
-        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-        require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
-        require_once ABSPATH . 'wp-admin/includes/update.php';
-
-        // Ensure '/wp-content/upgrade/' directory exists for unpack workspace
-        $upgrade_dir = WP_CONTENT_DIR . '/upgrade';
-        if (!file_exists($upgrade_dir)) {
-            @mkdir($upgrade_dir, 0755, true);
-        }
-
-        // Initialize WordPress Filesystem API to prevent silent file write failures
-        global $wp_filesystem;
-        if (empty($wp_filesystem)) {
-            ob_start();
-            $creds = request_filesystem_credentials('', '', false, false, null);
-            ob_end_clean();
-            if (!WP_Filesystem($creds)) {
-                if (!defined('FS_METHOD')) {
-                    define('FS_METHOD', 'direct');
-                }
-                WP_Filesystem();
+        // Bind custom error/warning handler to catch exact PHP execution failures (e.g., zip extract, file lock issues)
+        set_error_handler(function($severity, $message, $file, $line) {
+            if (!(error_reporting() & $severity)) {
+                return;
             }
-        }
+            throw new ErrorException($message, 0, $severity, $file, $line);
+        });
 
-        // Force FS_METHOD 'direct' to bypass prompt credentials
-        if (!defined('FS_METHOD')) {
-            define('FS_METHOD', 'direct');
-        }
-        add_filter('request_filesystem_credentials', '__return_true', 100);
+        try {
+            // 1. Elevate REST capability privilege context to Administrator programmatically
+            $admin_users = get_users(array('role' => 'Administrator'));
+            $admin_id = (!empty($admin_users)) ? $admin_users[0]->ID : 1;
+            wp_set_current_user($admin_id);
 
-        // Suppress any output/skin prints to prevent REST JSON response corruption
-        ob_start();
+            if (!defined('WP_ADMIN')) {
+                define('WP_ADMIN', true);
+            }
 
-        if ($type === 'core') {
-            // Force WP version check to populate update transients
-            wp_version_check();
+            // Hook direct filesystem method return to override any constraints in wp-config.php
+            add_filter('filesystem_method', function($method) { return 'direct'; }, 9999);
 
-            $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
-            $updates = get_core_updates();
+            // Load complete WordPress administrative upgrader utilities
+            require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            require_once ABSPATH . 'wp-admin/includes/theme.php';
+            require_once ABSPATH . 'wp-admin/includes/admin.php';
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+            require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+            require_once ABSPATH . 'wp-admin/includes/update.php';
 
-            if (empty($updates)) {
+            // Ensure '/wp-content/upgrade/' directory exists for unpack workspace
+            $upgrade_dir = WP_CONTENT_DIR . '/upgrade';
+            if (!file_exists($upgrade_dir)) {
+                @mkdir($upgrade_dir, 0755, true);
+            }
+
+            // Initialize WordPress Filesystem API to prevent silent file write failures
+            global $wp_filesystem;
+            if (empty($wp_filesystem)) {
+                ob_start();
+                $creds = request_filesystem_credentials('', '', false, false, null);
                 ob_end_clean();
+                if (!WP_Filesystem($creds)) {
+                    if (!defined('FS_METHOD')) {
+                        define('FS_METHOD', 'direct');
+                    }
+                    WP_Filesystem();
+                }
+            }
+
+            // Force FS_METHOD 'direct' to bypass prompt credentials
+            if (!defined('FS_METHOD')) {
+                define('FS_METHOD', 'direct');
+            }
+            add_filter('request_filesystem_credentials', '__return_true', 100);
+
+            // Suppress any output/skin prints to prevent REST JSON response corruption
+            ob_start();
+
+            if ($type === 'core') {
+                // Force WP version check to populate update transients
+                wp_version_check();
+
+                $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
+                $updates = get_core_updates();
+
+                if (empty($updates)) {
+                    ob_end_clean();
+                    restore_error_handler();
+                    return new WP_REST_Response(array(
+                        'status'  => 'success',
+                        'message' => 'WordPress Core is already up to date.'
+                    ), 200);
+                }
+
+                $result = $upgrader->upgrade($updates[0]);
+                ob_end_clean();
+
+                if (is_wp_error($result)) {
+                    restore_error_handler();
+                    return new WP_REST_Response(array(
+                        'status'  => 'error',
+                        'message' => 'Upgrader Error: ' . $result->get_error_message()
+                    ), 500);
+                }
+
+                restore_error_handler();
                 return new WP_REST_Response(array(
                     'status'  => 'success',
-                    'message' => 'WordPress Core is already up to date.'
+                    'message' => 'WordPress Core updated successfully.',
+                    'result'  => $result
                 ), 200);
-            }
 
-            $result = $upgrader->upgrade($updates[0]);
-            ob_end_clean();
-
-            if (is_wp_error($result)) {
-                return new WP_REST_Response(array(
-                    'status'  => 'error',
-                    'message' => $result->get_error_message()
-                ), 500);
-            }
-
-            return new WP_REST_Response(array(
-                'status'  => 'success',
-                'message' => 'WordPress Core updated successfully.',
-                'result'  => $result
-            ), 200);
-
-        } elseif ($type === 'plugin') {
-            $plugins = $params['plugins']; // Array of strings or objects: e.g., [{"file": "akismet/akismet.php", "package_url": "..."}]
-            if (empty($plugins) || !is_array($plugins)) {
-                ob_end_clean();
-                return new WP_REST_Response(array(
-                    'status'  => 'error',
-                    'message' => 'A valid list of plugins must be provided.'
-                ), 400);
-            }
-
-            // Force WP to check available plugin updates and populate transients
-            wp_update_plugins();
-
-            $standard_upgrades = array();
-            $custom_upgrades_results = array();
-
-            // Initialize Plugin Upgrader with silent automatic skin
-            $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
-
-            foreach ($plugins as $plugin_item) {
-                $plugin_file = '';
-                $package_url = '';
-
-                // Handle both simple formats (string) and custom vault formats (object)
-                if (is_string($plugin_item)) {
-                    $plugin_file = sanitize_text_field($plugin_item);
-                } elseif (is_array($plugin_item)) {
-                    $plugin_file = isset($plugin_item['file']) ? sanitize_text_field($plugin_item['file']) : '';
-                    $package_url = isset($plugin_item['package_url']) ? esc_url_raw($plugin_item['package_url']) : '';
+            } elseif ($type === 'plugin') {
+                $plugins = $params['plugins']; // Array of strings or objects: e.g., [{"file": "akismet/akismet.php", "package_url": "..."}]
+                if (empty($plugins) || !is_array($plugins)) {
+                    ob_end_clean();
+                    restore_error_handler();
+                    return new WP_REST_Response(array(
+                        'status'  => 'error',
+                        'message' => 'A valid list of plugins must be provided.'
+                    ), 400);
                 }
 
-                if (empty($plugin_file)) {
-                    continue;
-                }
+                // Force WP to check available plugin updates and populate transients
+                wp_update_plugins();
 
-                // If package_url is present, this is a premium/custom plugin sideload!
-                if (!empty($package_url)) {
-                    $download_result = download_url($package_url);
+                $standard_upgrades = array();
+                $custom_upgrades_results = array();
 
-                    if (is_wp_error($download_result)) {
-                        $custom_upgrades_results[$plugin_file] = array(
-                            'status'  => 'error',
-                            'message' => 'Failed to download custom package zip: ' . $download_result->get_error_message()
-                        );
+                // Initialize Plugin Upgrader with silent automatic skin
+                $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
+
+                foreach ($plugins as $plugin_item) {
+                    $plugin_file = '';
+                    $package_url = '';
+
+                    // Handle both simple formats (string) and custom vault formats (object)
+                    if (is_string($plugin_item)) {
+                        $plugin_file = sanitize_text_field($plugin_item);
+                    } elseif (is_array($plugin_item)) {
+                        $plugin_file = isset($plugin_item['file']) ? sanitize_text_field($plugin_item['file']) : '';
+                        $package_url = isset($plugin_item['package_url']) ? esc_url_raw($plugin_item['package_url']) : '';
+                    }
+
+                    if (empty($plugin_file)) {
                         continue;
                     }
 
-                    // Trigger direct local zip installation/overwrite
-                    $install_result = $upgrader->install($download_result, array('overwrite_package' => true));
+                    // If package_url is present, this is a premium/custom plugin sideload!
+                    if (!empty($package_url)) {
+                        $download_result = download_url($package_url);
 
-                    // Secure local cleanup of temporary download archive
-                    if (file_exists($download_result)) {
-                        @unlink($download_result);
-                    }
+                        if (is_wp_error($download_result)) {
+                            $custom_upgrades_results[$plugin_file] = array(
+                                'status'  => 'error',
+                                'message' => 'Failed to download custom package zip: ' . $download_result->get_error_message()
+                            );
+                            continue;
+                        }
 
-                    if (is_wp_error($install_result)) {
-                        $custom_upgrades_results[$plugin_file] = array(
-                            'status'  => 'error',
-                            'message' => $install_result->get_error_message()
-                        );
+                        // Trigger direct local zip installation/overwrite
+                        $install_result = $upgrader->install($download_result, array('overwrite_package' => true));
+
+                        // Secure local cleanup of temporary download archive
+                        if (file_exists($download_result)) {
+                            @unlink($download_result);
+                        }
+
+                        if (is_wp_error($install_result)) {
+                            $custom_upgrades_results[$plugin_file] = array(
+                                'status'  => 'error',
+                                'message' => $install_result->get_error_message()
+                            );
+                        } else {
+                            $custom_upgrades_results[$plugin_file] = array(
+                                'status'  => 'success',
+                                'message' => 'Sideloaded premium plugin updated successfully.'
+                            );
+                        }
                     } else {
-                        $custom_upgrades_results[$plugin_file] = array(
-                            'status'  => 'success',
-                            'message' => 'Sideloaded premium plugin updated successfully.'
-                        );
+                        // Standard public WordPress.org repository plugin
+                        $standard_upgrades[] = $plugin_file;
                     }
-                } else {
-                    // Standard public WordPress.org repository plugin
-                    $standard_upgrades[] = $plugin_file;
                 }
-            }
 
-            // Run standard public bulk upgrades
-            $standard_results = null;
-            if (!empty($standard_upgrades)) {
-                $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
-            }
+                // Run standard public bulk upgrades
+                $standard_results = null;
+                if (!empty($standard_upgrades)) {
+                    $standard_results = $upgrader->bulk_upgrade($standard_upgrades);
+                }
 
-            // Flush plugins cache and delete site transients so WP Admin reflects the updated values immediately
-            wp_clean_plugins_cache(true);
-            delete_site_transient('update_plugins');
+                // Flush plugins cache and delete site transients so WP Admin reflects the updated values immediately
+                wp_clean_plugins_cache(true);
+                delete_site_transient('update_plugins');
+
+                ob_end_clean();
+                restore_error_handler();
+
+                return new WP_REST_Response(array(
+                    'status'           => 'success',
+                    'message'          => 'Plugins update operation completed.',
+                    'custom_results'   => $custom_upgrades_results,
+                    'standard_results' => $standard_results
+                ), 200);
+            }
 
             ob_end_clean();
+            restore_error_handler();
 
             return new WP_REST_Response(array(
-                'status'           => 'success',
-                'message'          => 'Plugins update operation completed.',
-                'custom_results'   => $custom_upgrades_results,
-                'standard_results' => $standard_results
-            ), 200);
+                'status'  => 'error',
+                'message' => 'Invalid update type specified.'
+            ), 400);
+
+        } catch (Throwable $e) {
+            @ob_end_clean();
+            restore_error_handler();
+
+            $formatted_error = sprintf(
+                "PHP Exception during update: %s inside file %s at line %d",
+                $e->getMessage(),
+                basename($e->getFile()),
+                $e->getLine()
+            );
+
+            return new WP_REST_Response(array(
+                'status'  => 'error',
+                'message' => $formatted_error
+            ), 500);
+        } catch (Exception $e) {
+            @ob_end_clean();
+            restore_error_handler();
+
+            $formatted_error = sprintf(
+                "Exception during update: %s inside file %s at line %d",
+                $e->getMessage(),
+                basename($e->getFile()),
+                $e->getLine()
+            );
+
+            return new WP_REST_Response(array(
+                'status'  => 'error',
+                'message' => $formatted_error
+            ), 500);
         }
-
-        ob_end_clean();
-
-        return new WP_REST_Response(array(
-            'status'  => 'error',
-            'message' => 'Invalid update type specified.'
-        ), 400);
     }
 
     /**
