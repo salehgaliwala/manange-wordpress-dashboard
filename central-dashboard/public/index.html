@@ -165,6 +165,23 @@
                 }
             };
 
+            // Check for any currently active processing update/backup jobs to resume polling
+            const checkForActiveJobs = async () => {
+                try {
+                    const response = await fetch('/api/jobs/active');
+                    if (response.ok) {
+                        const activeJobsList = await response.json();
+                        if (activeJobsList && activeJobsList.length > 0) {
+                            const activeJob = activeJobsList[0];
+                            setActiveJobId(activeJob.id);
+                            startPollingJob(activeJob.id);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to check for active jobs:', err);
+                }
+            };
+
             // Check if user session cookie is already present on initialization
             useEffect(() => {
                 fetch('/api/session')
@@ -179,6 +196,7 @@
                             setIsAuthenticated(true);
                             fetchSites();
                             fetchVault();
+                            checkForActiveJobs();
                         }
                     })
                     .catch(() => {
@@ -188,6 +206,7 @@
                             setIsAuthenticated(true);
                             fetchSites();
                             fetchVault();
+                            checkForActiveJobs();
                         }
                     });
             }, []);
@@ -260,6 +279,7 @@
                         setTimeout(() => {
                             fetchSites();
                             fetchVault();
+                            checkForActiveJobs();
                         }, 100);
                     } else {
                         setLoginError(data.error || 'Invalid credentials. Please try again.');

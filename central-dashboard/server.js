@@ -33,8 +33,18 @@ const upload = multer({ dest: path.join(__dirname, 'temp_uploads') });
 // File-based JSON Database persistence helpers
 const DB_PATH = path.join(__dirname, 'data.json');
 
-// Global tracking dictionary for asynchronous update pipeline jobs
-const activeJobs = {};
+// Global tracking dictionary for asynchronous update pipeline jobs persisted in DB
+function getActiveJobs() {
+    const db = loadDB();
+    return db.jobs || {};
+}
+
+function saveActiveJob(jobId, jobState) {
+    const db = loadDB();
+    db.jobs = db.jobs || {};
+    db.jobs[jobId] = jobState;
+    saveDB(db);
+}
 
 function loadDB() {
     try {
@@ -529,13 +539,40 @@ app.post('/api/sites/:siteId/sync', requireAuth, async (req, res) => {
 });
 
 /**
+ * Get active job for a site
+ * GET /api/sites/:siteId/active-job
+ */
+app.get('/api/sites/:siteId/active-job', requireAuth, (req, res) => {
+    const { siteId } = req.params;
+    const db = loadDB();
+    const jobs = db.jobs || {};
+    const activeJob = Object.values(jobs).find(j => j.siteId === siteId && j.status === 'processing');
+    if (activeJob) {
+        return res.json(activeJob);
+    }
+    return res.status(404).json({ error: 'No active job found for this site.' });
+});
+
+/**
+ * GET /api/jobs/active
+ * Returns any active/processing jobs
+ */
+app.get('/api/jobs/active', requireAuth, (req, res) => {
+    const db = loadDB();
+    const jobs = db.jobs || {};
+    const activeJobsList = Object.values(jobs).filter(j => j.status === 'processing');
+    return res.json(activeJobsList);
+});
+
+/**
  * Real-time Active Updates status query endpoint
  * GET /api/jobs/:jobId
  * Protected by requireAuth
  */
 app.get('/api/jobs/:jobId', requireAuth, (req, res) => {
     const { jobId } = req.params;
-    const job = activeJobs[jobId];
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
     if (!job) {
         return res.status(404).json({ error: 'Job not found.' });
     }
@@ -606,7 +643,7 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const jobId = 'job_dashboard_' + Date.now();
 
     // Initialize job state in tracking map
-    activeJobs[jobId] = {
+    const initialJobState = {
         id: jobId,
         siteId: siteId,
         status: 'processing',
@@ -616,6 +653,7 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         completed: false,
         backup_path: ''
     };
+    saveActiveJob(jobId, initialJobState);
 
     const orchestrator = new SafeUpdateOrchestrator(site);
 
@@ -627,44 +665,48 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         { type, plugins, backup_destination: destination },
         (progress, step) => {
             // Progress Callback: Update active jobs tracking map in real-time
-            if (activeJobs[jobId]) {
-                activeJobs[jobId].progress = progress;
-                activeJobs[jobId].step = step;
+            const currentDB = loadDB();
+            if (currentDB.jobs && currentDB.jobs[jobId]) {
+                currentDB.jobs[jobId].progress = progress;
+                currentDB.jobs[jobId].step = step;
+                saveDB(currentDB);
             }
         }
     ).then(result => {
         // On Success
-        if (activeJobs[jobId]) {
-            activeJobs[jobId].status = 'completed';
-            activeJobs[jobId].progress = 100;
-            activeJobs[jobId].step = '✓ Pipeline execution complete! Target updated safely.';
-            activeJobs[jobId].completed = true;
-            activeJobs[jobId].backup_path = result.backup_path || 'S3 Cloud Storage Bucket';
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'completed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = '✓ Pipeline execution complete! Target updated safely.';
+            currentDB.jobs[jobId].completed = true;
+            currentDB.jobs[jobId].backup_path = result.backup_path || 'S3 Cloud Storage Bucket';
 
             // Update database metrics dynamically
-            const sIdx = db.sites.findIndex(s => s.id === siteId);
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
             if (sIdx !== -1) {
-                db.sites[sIdx].pendingUpdates = 0;
-                db.sites[sIdx].lastBackupStatus = 'success';
-                db.sites[sIdx].lastBackupTime = 'Just now';
-                saveDB(db);
+                currentDB.sites[sIdx].pendingUpdates = 0;
+                currentDB.sites[sIdx].lastBackupStatus = 'success';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now';
             }
+            saveDB(currentDB);
         }
     }).catch(err => {
         // On Failure
-        if (activeJobs[jobId]) {
-            activeJobs[jobId].status = 'failed';
-            activeJobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
-            activeJobs[jobId].error = err.message;
-            activeJobs[jobId].completed = true;
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'failed';
+            currentDB.jobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
+            currentDB.jobs[jobId].error = err.message;
+            currentDB.jobs[jobId].completed = true;
 
             // Update database metrics dynamically
-            const sIdx = db.sites.findIndex(s => s.id === siteId);
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
             if (sIdx !== -1) {
-                db.sites[sIdx].lastBackupStatus = 'fail';
-                db.sites[sIdx].lastBackupTime = 'Just now (Error)';
-                saveDB(db);
+                currentDB.sites[sIdx].lastBackupStatus = 'fail';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now (Error)';
             }
+            saveDB(currentDB);
         }
     });
 
