@@ -51,7 +51,7 @@ class SafeUpdateOrchestrator {
     async signedPost(endpoint, data) {
         const url = `${this.siteUrl}${endpoint}`;
         const headers = this.generateHeaders(data);
-        return axios.post(url, data, { headers });
+        return axios.post(url, data, { headers, timeout: 600000 });
     }
 
     /**
@@ -60,7 +60,7 @@ class SafeUpdateOrchestrator {
     async signedGet(endpoint, params = {}) {
         const url = `${this.siteUrl}${endpoint}`;
         const headers = this.generateHeaders('');
-        return axios.get(url, { headers, params });
+        return axios.get(url, { headers, params, timeout: 600000 });
     }
 
     /**
@@ -103,12 +103,49 @@ class SafeUpdateOrchestrator {
     }
 
     /**
+     * Helper to load the persistent JSON database
+     */
+    loadDB() {
+        const dbPath = path.join(__dirname, 'data.json');
+        try {
+            if (fs.existsSync(dbPath)) {
+                const content = fs.readFileSync(dbPath, 'utf8');
+                if (content && content.trim()) {
+                    return JSON.parse(content);
+                }
+            }
+        } catch (err) {
+            console.error('[Orchestrator DB Error] Failed to load JSON database:', err);
+        }
+        return {};
+    }
+
+    /**
+     * Helper to compare semantic versions (v1 > v2 returns 1, v1 < v2 returns -1, equal returns 0)
+     */
+    compareVersions(v1, v2) {
+        if (!v1 || !v2) return 0;
+        const parts1 = v1.replace(/[^0-9.]/g, '').split('.').map(Number);
+        const parts2 = v2.replace(/[^0-9.]/g, '').split('.').map(Number);
+        const len = Math.max(parts1.length, parts2.length);
+        for (let i = 0; i < len; i++) {
+            const p1 = parts1[i] || 0;
+            const p2 = parts2[i] || 0;
+            if (p1 > p2) return 1;
+            if (p1 < p2) return -1;
+        }
+        return 0;
+    }
+
+    /**
      * Helper to extract a slug from a plugin filepath string (e.g., 'akismet/akismet.php' -> 'akismet')
+     * Handles both folder-based and single-file plugins, lowercasing the output for consistency.
      */
     getPluginSlug(pluginFile) {
         if (!pluginFile) return '';
         const parts = pluginFile.split('/');
-        return parts[0];
+        let slug = parts.length > 1 ? parts[0] : pluginFile.replace(/\.php$/, '');
+        return slug.toLowerCase();
     }
 
     /**
@@ -169,6 +206,16 @@ class SafeUpdateOrchestrator {
             let finalUpdatePayload = { ...updateParams };
 
             if (updateParams.type === 'plugin' && Array.isArray(updateParams.plugins)) {
+                // Fetch target site status to check available plugin versions
+                let pluginsDetail = [];
+                try {
+                    const statusResponse = await this.signedGet('/wp-json/wp-central/v1/status');
+                    pluginsDetail = statusResponse.data.plugins_detail || [];
+                } catch (err) {
+                    console.warn('[Plugin Vault] Failed to retrieve remote status for version checks:', err.message);
+                }
+
+                const db = this.loadDB();
                 const enrichedPlugins = [];
 
                 for (const plugin of updateParams.plugins) {
@@ -186,10 +233,29 @@ class SafeUpdateOrchestrator {
                     const vaultDir = path.join(__dirname, 'vault');
                     const zipPath = path.join(vaultDir, `${slug}.zip`);
 
+                    const dbVaulted = db.vault && db.vault[slug];
+                    let useVaultVersion = false;
+
+                    if (dbVaulted && fs.existsSync(zipPath)) {
+                        const vaultedVersion = dbVaulted.version || '0.0.0';
+                        const installedPlugin = pluginsDetail.find(p => p.file === fileIdentifier);
+                        if (installedPlugin) {
+                            const currentVer = installedPlugin.current_version || '0.0.0';
+                            const newVer = installedPlugin.new_version || '0.0.0';
+                            if (this.compareVersions(vaultedVersion, currentVer) >= 0 || this.compareVersions(vaultedVersion, newVer) >= 0) {
+                                useVaultVersion = true;
+                            } else {
+                                console.log(`[Plugin Vault] Vault version (${vaultedVersion}) is older than installed/new version (${currentVer}/${newVer}), falling back to repo.`);
+                            }
+                        } else {
+                            // Default to true if not found in status list
+                            useVaultVersion = true;
+                        }
+                    }
+
                     let pluginDataEntry = { file: fileIdentifier };
 
-                    // If a matching .zip package exists in our Plugin Vault
-                    if (fs.existsSync(zipPath)) {
+                    if (useVaultVersion) {
                         console.log(`[Plugin Vault] Found custom package for slug: ${slug}`);
                         // Generate secure, short-lived download token
                         const secureToken = this.generateDownloadToken(slug);

@@ -105,10 +105,7 @@
             // Dashboard and sites state
             const [sites, setSites] = useState([]);
 
-            const [vaultPlugins, setVaultPlugins] = useState([
-                { name: 'Sideload Security Suite', slug: 'sideload-security-suite', version: '4.1.2', author: 'WP Vault Devs' },
-                { name: 'Custom WooCommerce Optimizer', slug: 'custom-woo-optimizer', version: '1.0.5', author: 'Retail Corp' }
-            ]);
+            const [vaultPlugins, setVaultPlugins] = useState([]);
 
             const [selectedSiteIds, setSelectedSiteIds] = useState(new Set());
             const [searchTerm, setSearchTerm] = useState('');
@@ -155,6 +152,19 @@
                 }
             };
 
+            // Fetch vault inventory from backend API
+            const fetchVault = async () => {
+                try {
+                    const response = await fetch('/api/vault');
+                    if (response.ok) {
+                        const data = await response.json();
+                        setVaultPlugins(data);
+                    }
+                } catch (err) {
+                    console.error('Failed to fetch vault from backend:', err);
+                }
+            };
+
             // Check if user session cookie is already present on initialization
             useEffect(() => {
                 fetch('/api/session')
@@ -168,6 +178,7 @@
                         if (data.authenticated) {
                             setIsAuthenticated(true);
                             fetchSites();
+                            fetchVault();
                         }
                     })
                     .catch(() => {
@@ -176,6 +187,7 @@
                         if (token) {
                             setIsAuthenticated(true);
                             fetchSites();
+                            fetchVault();
                         }
                     });
             }, []);
@@ -247,6 +259,7 @@
                         setIsAuthenticated(true);
                         setTimeout(() => {
                             fetchSites();
+                            fetchVault();
                         }, 100);
                     } else {
                         setLoginError(data.error || 'Invalid credentials. Please try again.');
@@ -363,23 +376,37 @@
                 }
             };
 
-            // Simulated premium plugin file upload
-            const simulateUpload = (e) => {
+            // Real premium plugin file upload
+            const handlePluginUpload = async (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
 
                 setUploadStatus('uploading');
-                setTimeout(() => {
-                    const mockMeta = {
-                        name: file.name.replace('.zip', '').split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '),
-                        slug: file.name.replace('.zip', '').toLowerCase(),
-                        version: '3.1.0',
-                        author: 'Plugin Sideload Corp'
-                    };
-                    setUploadStatus('success');
-                    setParsedPlugin(mockMeta);
-                    setVaultPlugins(prev => [mockMeta, ...prev]);
-                }, 1800);
+                setParsedPlugin(null);
+
+                const formData = new FormData();
+                formData.append('plugin', file);
+
+                try {
+                    const response = await fetch('/api/plugins/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const data = await response.json();
+                    if (response.ok) {
+                        setUploadStatus('success');
+                        setParsedPlugin(data.plugin);
+                        fetchVault();
+                    } else {
+                        alert(data.error || 'Failed to upload plugin.');
+                        setUploadStatus('idle');
+                    }
+                } catch (err) {
+                    console.error('Error uploading plugin:', err);
+                    alert('Network error trying to upload plugin.');
+                    setUploadStatus('idle');
+                }
             };
 
             // Open Site Detail & Action Center
@@ -876,7 +903,7 @@
                                     <input
                                         type="file"
                                         id="vault-file-picker"
-                                        onChange={simulateUpload}
+                                        onChange={handlePluginUpload}
                                         accept=".zip"
                                         className="hidden"
                                     />
@@ -924,8 +951,22 @@
                                                         <td className="py-2.5 font-bold">v{plugin.version}</td>
                                                         <td className="py-2.5 text-right">
                                                             <button
-                                                                onClick={() => {
-                                                                    setVaultPlugins(prev => prev.filter((_, i) => i !== idx));
+                                                                onClick={async () => {
+                                                                    if (confirm(`Are you sure you want to delete ${plugin.name} from vault?`)) {
+                                                                        try {
+                                                                            const res = await fetch(`/api/vault/${plugin.slug}`, {
+                                                                                method: 'DELETE'
+                                                                            });
+                                                                            if (res.ok) {
+                                                                                fetchVault();
+                                                                            } else {
+                                                                                const data = await res.json();
+                                                                                alert(data.error || 'Failed to delete plugin.');
+                                                                            }
+                                                                        } catch (e) {
+                                                                            alert('Error deleting plugin.');
+                                                                        }
+                                                                    }
                                                                 }}
                                                                 className="text-rose-400 hover:text-rose-300 font-bold"
                                                             >

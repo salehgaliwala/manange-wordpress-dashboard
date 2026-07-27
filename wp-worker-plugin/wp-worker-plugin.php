@@ -302,7 +302,10 @@ public function get_wp_status(WP_REST_Request $request) {
             return false;
         }
 
-        set_time_limit(0);
+        @set_time_limit(0);
+        if (function_exists('session_write_close')) {
+            @session_write_close();
+        }
         if (function_exists('ignore_user_abort')) {
             ignore_user_abort(true);
         }
@@ -397,7 +400,10 @@ public function get_wp_status(WP_REST_Request $request) {
     public function handle_updates(WP_REST_Request $request) {
     // 1. Force higher limits for this thread
     @ini_set('memory_limit', '512M');
-    @set_time_limit(300);
+    @set_time_limit(0);
+    if (function_exists('session_write_close')) {
+        @session_write_close();
+    }
 
     // 2. Register shutdown function to catch silent fatal crashes
     register_shutdown_function(function() {
@@ -636,6 +642,7 @@ public function get_wp_status(WP_REST_Request $request) {
     $wp_content_dir = wp_normalize_path(rtrim(WP_CONTENT_DIR, '/\\'));
     $norm_exclude_dir = wp_normalize_path($exclude_dir);
     $norm_backups_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
+    $norm_uploads_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads');
 
     $files = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -646,8 +653,8 @@ public function get_wp_status(WP_REST_Request $request) {
         if (!$file->isDir()) {
             $real_path = wp_normalize_path($file->getRealPath());
 
-            // Skip current temp directory and local backup vault
-            if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0)) {
+            // Skip current temp directory, local backup vault, and the heavy uploads folder
+            if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0 || strpos($real_path, $norm_uploads_dir) === 0)) {
                 continue;
             }
 
