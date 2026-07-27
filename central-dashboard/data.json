@@ -3,36 +3,18 @@
     "username": "admin@example.com",
     "passwordHash": "245b22dce938051efc28cf4364928fa26e171db139755311a93703ba65fd6d07"
   },
-  "tokenSecret": "df061801d368e7b399cf766ea9d99763261a9bb7fbeeb2491b32cc6ef784e12c",
+  "tokenSecret": "12c0ff068dc9a81fffeaa026ca653050a2bfeb4048d3206a55eb684105079a06",
   "sites": [
     {
-      "id": "2",
-      "name": "Omega Shop",
-      "url": "https://site-omega.com",
-      "secretKey": "wp_central_shared_secret_key_999",
-      "dashboardBaseUrl": "http://localhost:3002",
-      "wpVersion": "6.3.1",
-      "pendingUpdates": 0,
-      "lastBackupStatus": "success",
-      "lastBackupTime": "1 day ago",
-      "s3Config": {
-        "bucket": "wp-backups-bucket",
-        "endpoint": "https://s3.us-east-1.amazonaws.com",
-        "region": "us-east-1",
-        "accessKey": "MOCK_S3_ACCESS_KEY",
-        "secretKey": "MOCK_S3_SECRET_KEY"
-      }
-    },
-    {
-      "id": "3",
-      "name": "Beta Agency",
-      "url": "https://site-beta.com",
+      "id": "example-wp-site",
+      "name": "Local WP Container",
+      "url": "http://localhost:8080",
       "secretKey": "wp_central_shared_secret_key_999",
       "dashboardBaseUrl": "http://localhost:3002",
       "wpVersion": "6.4.2",
-      "pendingUpdates": 12,
+      "pendingUpdates": 2,
       "lastBackupStatus": "fail",
-      "lastBackupTime": "3 days ago",
+      "lastBackupTime": "Just now (Error)",
       "s3Config": {
         "bucket": "wp-backups-bucket",
         "endpoint": "https://s3.us-east-1.amazonaws.com",
@@ -49,15 +31,123 @@
       "version": "2.1.4",
       "author": "Vault Development Corp",
       "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-27T10:24:10.768Z"
+      "uploadedAt": "2026-07-27T13:04:00.121Z"
+    }
+  },
+  "jobs": {
+    "job_dashboard_1785157282651": {
+      "id": "job_dashboard_1785157282651",
+      "siteId": "example-wp-site",
+      "status": "processing",
+      "progress": 15,
+      "step": "Triggering target backup execution on target...",
+      "error": null,
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "local"
+      }
     },
-    "test-plugin": {
-      "name": "Test Sideloaded Plugin",
-      "slug": "test-plugin",
-      "version": "1.0.0",
-      "author": "Sideload Developer",
-      "filePath": "/app/central-dashboard/vault/test-plugin.zip",
-      "uploadedAt": "2026-07-27T06:38:49.520Z"
+    "job_dashboard_1785157283965": {
+      "id": "job_dashboard_1785157283965",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3"
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-27T13:19:41.732Z"
+    },
+    "job_dashboard_1785157438808": {
+      "id": "job_dashboard_1785157438808",
+      "siteId": "example-wp-site",
+      "status": "processing",
+      "progress": 15,
+      "step": "Triggering target backup execution on target...",
+      "error": null,
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "local"
+      }
+    },
+    "job_dashboard_1785157440127": {
+      "id": "job_dashboard_1785157440127",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3"
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-27T13:04:00.143Z"
+    },
+    "job_dashboard_1785158289881": {
+      "id": "job_dashboard_1785158289881",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "s3"
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-27T13:18:09.888Z"
+    },
+    "job_dashboard_1785158377063": {
+      "id": "job_dashboard_1785158377063",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "s3"
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-27T13:19:37.073Z"
     }
   }
 }

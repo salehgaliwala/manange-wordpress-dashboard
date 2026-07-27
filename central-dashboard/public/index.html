@@ -109,7 +109,6 @@
 
             const [selectedSiteIds, setSelectedSiteIds] = useState(new Set());
             const [searchTerm, setSearchTerm] = useState('');
-            const [activeJobId, setActiveJobId] = useState(null);
             const [isTriggeringBulk, setIsTriggeringBulk] = useState(false);
             const [bulkActionResult, setBulkActionResult] = useState(null);
 
@@ -124,11 +123,9 @@
             // Backup destination preference ('s3' or 'local')
             const [backupDest, setBackupDest] = useState('s3');
 
-            // Job queue tracking dynamic state
-            const [jobProgress, setJobProgress] = useState(0);
-            const [jobStep, setJobStep] = useState('Initializing');
-            const [finalBackupPath, setFinalBackupPath] = useState('');
-            const [jobFailed, setJobFailed] = useState(false);
+            // Job queue tracking dynamic states for concurrent jobs
+            const [activeJobs, setActiveJobs] = useState([]);
+            const [dismissedJobIds, setDismissedJobIds] = useState(new Set());
 
             // Detailed view modal state (Site Detail & Action Center)
             const [viewingSite, setViewingSite] = useState(null);
@@ -165,22 +162,26 @@
                 }
             };
 
-            // Check for any currently active processing update/backup jobs to resume polling
-            const checkForActiveJobs = async () => {
+            // Poll for all active/processing or broken/resumable background jobs
+            const pollAllActiveJobs = async () => {
                 try {
                     const response = await fetch('/api/jobs/active');
                     if (response.ok) {
-                        const activeJobsList = await response.json();
-                        if (activeJobsList && activeJobsList.length > 0) {
-                            const activeJob = activeJobsList[0];
-                            setActiveJobId(activeJob.id);
-                            startPollingJob(activeJob.id);
-                        }
+                        const data = await response.json();
+                        setActiveJobs(data);
                     }
                 } catch (err) {
-                    console.error('Failed to check for active jobs:', err);
+                    console.error('Failed to fetch active/broken jobs:', err);
                 }
             };
+
+            // Poll active jobs on an interval
+            useEffect(() => {
+                if (!isAuthenticated) return;
+                pollAllActiveJobs(); // Initial load
+                const interval = setInterval(pollAllActiveJobs, 2500);
+                return () => clearInterval(interval);
+            }, [isAuthenticated]);
 
             // Check if user session cookie is already present on initialization
             useEffect(() => {
@@ -196,7 +197,6 @@
                             setIsAuthenticated(true);
                             fetchSites();
                             fetchVault();
-                            checkForActiveJobs();
                         }
                     })
                     .catch(() => {
@@ -206,7 +206,6 @@
                             setIsAuthenticated(true);
                             fetchSites();
                             fetchVault();
-                            checkForActiveJobs();
                         }
                     });
             }, []);
@@ -453,53 +452,40 @@
                 }
             };
 
-            // Start Real-Time Job Progress Polling on backend
-            const startPollingJob = (jobId) => {
-                if (pollerRef.current) clearInterval(pollerRef.current);
-                setJobFailed(false);
-
-                pollerRef.current = setInterval(async () => {
-                    try {
-                        const res = await fetch(`/api/jobs/${jobId}`);
-                        if (res.ok) {
-                            const job = await res.json();
-                            setJobProgress(job.progress);
-                            setJobStep(job.step);
-
-                            if (job.status === 'completed') {
-                                clearInterval(pollerRef.current);
-                                setFinalBackupPath(job.backup_path || 'S3 Cloud Storage Bucket');
-                                fetchSites(); // Sync main dashboard stats
-                            } else if (job.status === 'failed') {
-                                clearInterval(pollerRef.current);
-                                setJobFailed(true);
-                                fetchSites();
-                            }
-                        }
-                    } catch (err) {
-                        console.error('Error polling active job:', err);
+            // Handle Job Resumption for broken/failed tasks
+            const handleResumeJob = async (jobId) => {
+                try {
+                    const response = await fetch(`/api/jobs/${jobId}/resume`, {
+                        method: 'POST'
+                    });
+                    if (response.ok) {
+                        // Refresh the active jobs list immediately
+                        pollAllActiveJobs();
+                    } else {
+                        const data = await response.json();
+                        alert(data.error || 'Failed to resume job.');
                     }
-                }, 2000);
+                } catch (err) {
+                    alert('Error attempting to resume job.');
+                }
             };
 
-            // Cleanup poller on unmount
-            useEffect(() => {
-                return () => {
-                    if (pollerRef.current) clearInterval(pollerRef.current);
-                };
-            }, []);
+            // Dismiss Job Card locally
+            const dismissJob = (jobId) => {
+                const next = new Set(dismissedJobIds);
+                next.add(jobId);
+                setDismissedJobIds(next);
+            };
 
             // Automated Safe Update Pipeline Execution
             const triggerSafeUpdatePipeline = async (type, specifiedPlugins = []) => {
                 if (!viewingSite) return;
 
+                const targetSite = viewingSite;
                 setViewingSite(null); // Close detail pane
-                setActiveJobId('initializing...');
-                setJobProgress(10);
-                setJobStep('Contacting orchestrator backend...');
 
                 try {
-                    const res = await fetch(`/api/sites/${viewingSite.id}/safe-update`, {
+                    const res = await fetch(`/api/sites/${targetSite.id}/safe-update`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -510,18 +496,14 @@
                     });
 
                     if (res.status === 202) {
-                        const data = await res.json();
-                        setActiveJobId(data.job_id);
-                        // Launch active progress poller
-                        startPollingJob(data.job_id);
+                        // Refresh active jobs list immediately so the new job card renders instantly!
+                        pollAllActiveJobs();
                     } else {
                         const data = await res.json();
                         alert(data.error || 'Failed to start safe update pipeline.');
-                        setActiveJobId(null);
                     }
                 } catch (err) {
                     alert('Network error executing update pipeline.');
-                    setActiveJobId(null);
                 }
             };
 
@@ -694,62 +676,77 @@
                             </div>
                         </div>
 
-                        {/* Direct Update Progress bar indicator - REAL TIME POLLED FROM BACKEND */}
-                        {activeJobId && (
-                            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-4 animate-fadeIn">
-                                <div className="flex justify-between items-center">
-                                    <div>
-                                        <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                                            {!jobFailed && jobProgress < 100 ? (
-                                                <span className="flex h-2 w-2 relative">
-                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-                                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-                                                </span>
-                                            ) : null}
-                                            {jobFailed ? '⚠️ Automated Update Pipeline Failed' : 'Automated Update Pipeline Progress'}
-                                        </h3>
-                                        <p className="text-xs text-slate-400 font-mono mt-0.5">Job ID: {activeJobId}</p>
-                                    </div>
-                                    <button
-                                        onClick={() => {
-                                            setActiveJobId(null);
-                                            setJobFailed(false);
-                                        }}
-                                        className="text-xs text-slate-500 hover:text-slate-100 bg-slate-950 px-2.5 py-1 border border-slate-800 rounded-md"
-                                    >
-                                        Dismiss
-                                    </button>
-                                </div>
+                        {/* Multi-Card Background Job Feed - REAL-TIME POLLED */}
+                        {activeJobs.filter(j => !dismissedJobIds.has(j.id)).length > 0 && (
+                            <div className="space-y-4">
+                                <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider block">Active Update & Backup Pipelines ({activeJobs.filter(j => !dismissedJobIds.has(j.id)).length})</h3>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    {activeJobs.filter(j => !dismissedJobIds.has(j.id)).map((job) => {
+                                        const siteName = sites.find(s => s.id === job.siteId)?.name || 'WordPress Site';
+                                        const isBroken = job.status === 'broken';
+                                        return (
+                                            <div key={job.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-4 animate-fadeIn relative overflow-hidden">
+                                                <div className="flex justify-between items-start">
+                                                    <div>
+                                                        <h4 className="font-bold text-slate-100 text-sm flex items-center gap-2">
+                                                            {!isBroken ? (
+                                                                <span className="flex h-2.5 w-2.5 relative">
+                                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+                                                                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-violet-500"></span>
+                                                                </span>
+                                                            ) : (
+                                                                <span className="inline-flex rounded-full h-2.5 w-2.5 bg-rose-500 animate-pulse"></span>
+                                                            )}
+                                                            {siteName}
+                                                        </h4>
+                                                        <p className="text-[10px] text-slate-500 font-mono mt-0.5">Job ID: {job.id}</p>
+                                                    </div>
+                                                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase font-mono tracking-wider ${
+                                                        isBroken
+                                                            ? 'bg-rose-950/20 text-rose-400 border border-rose-900/40'
+                                                            : 'bg-violet-950/20 text-violet-400 border border-violet-900/40'
+                                                    }`}>
+                                                        {isBroken ? '⚠️ Broken / Resumable' : 'Processing...'}
+                                                    </span>
+                                                </div>
 
-                                <div className="space-y-2">
-                                    <div className="flex justify-between items-center text-xs font-semibold">
-                                        <span className={jobFailed ? 'text-rose-400' : 'text-violet-400'}>{jobStep}</span>
-                                        <span className="text-slate-300 font-mono text-sm font-bold">{jobProgress}%</span>
-                                    </div>
-                                    <div className="w-full bg-slate-950 rounded-full h-3 border border-slate-800 overflow-hidden p-0.5">
-                                        <div
-                                            className={`h-full rounded-full transition-all duration-500 ${
-                                                jobFailed ? 'bg-rose-600' : 'bg-gradient-to-r from-violet-600 to-indigo-500'
-                                            }`}
-                                            style={{ width: `${jobProgress}%` }}
-                                        />
-                                    </div>
-                                </div>
+                                                <div className="space-y-2">
+                                                    <div className="flex justify-between items-center text-xs font-semibold">
+                                                        <span className={isBroken ? 'text-rose-400 font-bold' : 'text-slate-300'}>
+                                                            {job.stepDescription || job.step}
+                                                        </span>
+                                                        <span className="text-slate-100 font-mono text-sm font-bold">{job.progress || 10}%</span>
+                                                    </div>
+                                                    <div className="w-full bg-slate-950 rounded-full h-2.5 border border-slate-800 overflow-hidden p-0.5">
+                                                        <div
+                                                            className={`h-full rounded-full transition-all duration-500 ${
+                                                                isBroken ? 'bg-rose-600' : 'bg-gradient-to-r from-violet-600 to-indigo-500'
+                                                            }`}
+                                                            style={{ width: `${job.progress || 10}%` }}
+                                                        />
+                                                    </div>
+                                                </div>
 
-                                {jobProgress >= 100 && !jobFailed && (
-                                    <div className="pt-4 border-t border-slate-800">
-                                        <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
-                                            <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
-                                            <p className="text-xs text-slate-300">
-                                                WordPress core and plugin packages have been safely updated directly on the worker. The previous system files and database were archived and secure.
-                                            </p>
-                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
-                                                <span className="text-slate-500 font-semibold">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump (Skip non-readable files: Enabled)<br/>
-                                                <span className="text-slate-500 font-semibold">Backup Storage Destination:</span> {finalBackupPath}
+                                                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800/60">
+                                                    {isBroken && (
+                                                        <button
+                                                            onClick={() => handleResumeJob(job.id)}
+                                                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3.5 py-1.5 rounded-lg transition shadow-md shadow-emerald-500/15"
+                                                        >
+                                                            Resume Job
+                                                        </button>
+                                                    )}
+                                                    <button
+                                                        onClick={() => dismissJob(job.id)}
+                                                        className="text-xs text-slate-400 hover:text-slate-100 bg-slate-950 px-3 py-1.5 border border-slate-800 rounded-lg font-semibold"
+                                                    >
+                                                        Dismiss
+                                                    </button>
+                                                </div>
                                             </div>
-                                        </div>
-                                    </div>
-                                )}
+                                        );
+                                    })}
+                                </div>
                             </div>
                         )}
 

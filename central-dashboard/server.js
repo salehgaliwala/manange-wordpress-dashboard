@@ -555,12 +555,12 @@ app.get('/api/sites/:siteId/active-job', requireAuth, (req, res) => {
 
 /**
  * GET /api/jobs/active
- * Returns any active/processing jobs
+ * Returns any active/processing or broken/resumable jobs
  */
 app.get('/api/jobs/active', requireAuth, (req, res) => {
     const db = loadDB();
     const jobs = db.jobs || {};
-    const activeJobsList = Object.values(jobs).filter(j => j.status === 'processing');
+    const activeJobsList = Object.values(jobs).filter(j => j.status === 'processing' || j.status === 'broken');
     return res.json(activeJobsList);
 });
 
@@ -577,6 +577,93 @@ app.get('/api/jobs/:jobId', requireAuth, (req, res) => {
         return res.status(404).json({ error: 'Job not found.' });
     }
     return res.json(job);
+});
+
+/**
+ * Request step resumption for a suspended/broken job
+ * POST /api/jobs/:jobId/resume
+ * Protected by requireAuth
+ */
+app.post('/api/jobs/:jobId/resume', requireAuth, async (req, res) => {
+    const { jobId } = req.params;
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found.' });
+    }
+
+    if (job.status !== 'broken' && !job.resumable) {
+        return res.status(400).json({ error: 'Job is not in a resumable/broken state.' });
+    }
+
+    const siteId = job.siteId;
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Associated site not found.' });
+    }
+
+    // Set status back to processing
+    job.status = 'processing';
+    job.progress = job.progress || 10;
+    job.error = null;
+    job.step = 'Resuming pipeline execution...';
+    saveActiveJob(jobId, job);
+
+    const orchestrator = new SafeUpdateOrchestrator(site);
+    const updateParams = { ...job.updateParams, jobId };
+
+    // Launch pipeline in background
+    orchestrator.executeSafeUpdate(
+        updateParams,
+        (progress, step) => {
+            const currentDB = loadDB();
+            if (currentDB.jobs && currentDB.jobs[jobId]) {
+                currentDB.jobs[jobId].progress = progress;
+                currentDB.jobs[jobId].step = step;
+                saveDB(currentDB);
+            }
+        }
+    ).then(result => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'completed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = '✓ Pipeline execution complete! Target updated safely.';
+            currentDB.jobs[jobId].completed = true;
+            currentDB.jobs[jobId].backup_path = result.backup_path || 'S3 Cloud Storage Bucket';
+
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
+            if (sIdx !== -1) {
+                currentDB.sites[sIdx].pendingUpdates = 0;
+                currentDB.sites[sIdx].lastBackupStatus = 'success';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now';
+            }
+            saveDB(currentDB);
+        }
+    }).catch(err => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            if (currentDB.jobs[jobId].status !== 'broken') {
+                currentDB.jobs[jobId].status = 'broken';
+            }
+            currentDB.jobs[jobId].completed = false;
+            currentDB.jobs[jobId].resumable = true;
+            currentDB.jobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
+            currentDB.jobs[jobId].error = err.message;
+
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
+            if (sIdx !== -1) {
+                currentDB.sites[sIdx].lastBackupStatus = 'fail';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now (Error)';
+            }
+            saveDB(currentDB);
+        }
+    });
+
+    return res.json({
+        message: 'Job resumption initiated successfully.',
+        job
+    });
 });
 
 /**
@@ -641,6 +728,7 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
 
     // Generate unique Job ID on the dashboard
     const jobId = 'job_dashboard_' + Date.now();
+    const destination = backup_destination || 's3';
 
     // Initialize job state in tracking map
     const initialJobState = {
@@ -651,18 +739,16 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         step: 'Initializing Pipeline Connection...',
         error: null,
         completed: false,
-        backup_path: ''
+        backup_path: '',
+        updateParams: { type, plugins, backup_destination: destination }
     };
     saveActiveJob(jobId, initialJobState);
 
     const orchestrator = new SafeUpdateOrchestrator(site);
 
-    // Launch pipeline in the background (NON-BLOCKING asynchronous orchestration!)
-    const destination = backup_destination || 's3';
-
     // We execute the promise in the background without holding the HTTP response thread
     orchestrator.executeSafeUpdate(
-        { type, plugins, backup_destination: destination },
+        { jobId, type, plugins, backup_destination: destination },
         (progress, step) => {
             // Progress Callback: Update active jobs tracking map in real-time
             const currentDB = loadDB();
@@ -695,10 +781,13 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         // On Failure
         const currentDB = loadDB();
         if (currentDB.jobs && currentDB.jobs[jobId]) {
-            currentDB.jobs[jobId].status = 'failed';
+            if (currentDB.jobs[jobId].status !== 'broken') {
+                currentDB.jobs[jobId].status = 'broken';
+            }
+            currentDB.jobs[jobId].completed = false;
+            currentDB.jobs[jobId].resumable = true;
             currentDB.jobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
             currentDB.jobs[jobId].error = err.message;
-            currentDB.jobs[jobId].completed = true;
 
             // Update database metrics dynamically
             const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
