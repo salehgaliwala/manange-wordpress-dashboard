@@ -31,7 +31,7 @@
       "version": "2.1.4",
       "author": "Vault Development Corp",
       "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-27T13:04:00.121Z"
+      "uploadedAt": "2026-07-27T14:17:00.692Z"
     }
   },
   "jobs": {
@@ -148,6 +148,43 @@
       "stepDescription": "⚠️ Pipeline broken: ",
       "resumable": true,
       "updatedAt": "2026-07-27T13:19:37.073Z"
+    },
+    "job_dashboard_1785161819393": {
+      "id": "job_dashboard_1785161819393",
+      "siteId": "example-wp-site",
+      "status": "processing",
+      "progress": 15,
+      "step": "Triggering target backup execution on target...",
+      "error": null,
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "local"
+      }
+    },
+    "job_dashboard_1785161820697": {
+      "id": "job_dashboard_1785161820697",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3"
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-27T14:17:00.712Z"
     }
   }
 }
