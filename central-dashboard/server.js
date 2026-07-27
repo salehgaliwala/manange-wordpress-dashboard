@@ -682,6 +682,46 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', service: 'WP Central Dashboard' });
 });
 
+/**
+ * GET /api/vault
+ * Returns the list of vaulted plugins
+ * Protected by requireAuth
+ */
+app.get('/api/vault', requireAuth, (req, res) => {
+    const db = loadDB();
+    const vault = db.vault || {};
+    return res.json(Object.values(vault));
+});
+
+/**
+ * DELETE /api/vault/:slug
+ * Deletes a plugin from the vault and disk
+ * Protected by requireAuth
+ */
+app.delete('/api/vault/:slug', requireAuth, (req, res) => {
+    const { slug } = req.params;
+    const db = loadDB();
+
+    if (db.vault && db.vault[slug]) {
+        const metadata = db.vault[slug];
+        const zipPath = metadata.filePath || path.join(VAULT_DIR, `${slug}.zip`);
+
+        try {
+            if (fs.existsSync(zipPath)) {
+                fs.unlinkSync(zipPath);
+            }
+        } catch (err) {
+            console.error(`[Plugin Vault Delete Error] Failed to delete file ${zipPath}:`, err.message);
+        }
+
+        delete db.vault[slug];
+        saveDB(db);
+        return res.json({ message: 'Plugin successfully deleted from vault.' });
+    }
+
+    return res.status(404).json({ error: 'Plugin not found in vault.' });
+});
+
 // Provide a way for testing script to retrieve VAULT_DB
 app.get('/api/test/vault', (req, res) => {
     const db = loadDB();

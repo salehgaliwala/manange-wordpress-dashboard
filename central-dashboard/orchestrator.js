@@ -104,11 +104,13 @@ class SafeUpdateOrchestrator {
 
     /**
      * Helper to extract a slug from a plugin filepath string (e.g., 'akismet/akismet.php' -> 'akismet')
+     * Handles both folder-based and single-file plugins, lowercasing the output for consistency.
      */
     getPluginSlug(pluginFile) {
         if (!pluginFile) return '';
         const parts = pluginFile.split('/');
-        return parts[0];
+        let slug = parts.length > 1 ? parts[0] : pluginFile.replace(/\.php$/, '');
+        return slug.toLowerCase();
     }
 
     /**
