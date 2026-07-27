@@ -555,13 +555,130 @@ app.get('/api/sites/:siteId/active-job', requireAuth, (req, res) => {
 
 /**
  * GET /api/jobs/active
- * Returns any active/processing jobs
+ * Returns any active, paused, or stopped jobs currently in the registry
  */
 app.get('/api/jobs/active', requireAuth, (req, res) => {
     const db = loadDB();
     const jobs = db.jobs || {};
-    const activeJobsList = Object.values(jobs).filter(j => j.status === 'processing');
-    return res.json(activeJobsList);
+    return res.json(Object.values(jobs));
+});
+
+/**
+ * Pause job
+ * POST /api/jobs/:jobId/pause
+ * Protected by requireAuth
+ */
+app.post('/api/jobs/:jobId/pause', requireAuth, async (req, res) => {
+    const { jobId } = req.params;
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found.' });
+    }
+    if (job.status !== 'processing') {
+        return res.status(400).json({ error: 'Only actively processing jobs can be paused.' });
+    }
+
+    job.status = 'paused';
+    job.step = 'paused';
+    job.stepDescription = 'Job paused by administrator.';
+    saveDB(db);
+
+    // Send signal to target WP worker
+    const siteId = job.siteId;
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (site) {
+        const orchestrator = new SafeUpdateOrchestrator(site);
+        try {
+            await orchestrator.signedPost('/wp-json/wp-central/v1/job-control', {
+                job_id: jobId,
+                action: 'pause'
+            });
+        } catch (err) {
+            console.warn('[Dashboard Pause] Failed to notify target worker of pause:', err.message);
+        }
+    }
+
+    return res.json({ message: 'Pause signal registered successfully.', job });
+});
+
+/**
+ * Kill job
+ * POST /api/jobs/:jobId/kill
+ * Protected by requireAuth
+ */
+app.post('/api/jobs/:jobId/kill', requireAuth, async (req, res) => {
+    const { jobId } = req.params;
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found.' });
+    }
+
+    job.status = 'killed';
+    job.step = 'killed';
+    job.stepDescription = 'Pipeline forcibly aborted.';
+    saveDB(db);
+
+    // Send signal to target WP worker
+    const siteId = job.siteId;
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (site) {
+        const orchestrator = new SafeUpdateOrchestrator(site);
+        try {
+            await orchestrator.signedPost('/wp-json/wp-central/v1/job-control', {
+                job_id: jobId,
+                action: 'kill'
+            });
+        } catch (err) {
+            console.warn('[Dashboard Kill] Failed to notify target worker of cancellation:', err.message);
+        }
+    }
+
+    // Clean up active temp files associated with jobId (screenshots, etc)
+    try {
+        const publicFiles = fs.readdirSync(path.join(__dirname, 'public'));
+        for (const file of publicFiles) {
+            if (file.includes(jobId)) {
+                fs.unlinkSync(path.join(__dirname, 'public', file));
+            }
+        }
+    } catch (e) {}
+
+    return res.json({ message: 'Kill signal dispatched successfully.', job });
+});
+
+/**
+ * Delete job record
+ * DELETE /api/jobs/:jobId
+ * Protected by requireAuth
+ */
+app.delete('/api/jobs/:jobId', requireAuth, (req, res) => {
+    const { jobId } = req.params;
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found.' });
+    }
+
+    if (job.status === 'processing') {
+        return res.status(400).json({ error: 'Cannot delete an actively processing job. Kill or pause it first.' });
+    }
+
+    delete db.jobs[jobId];
+    saveDB(db);
+
+    // Remove any visual regression screenshot files or local archives created for this job ID
+    try {
+        const publicFiles = fs.readdirSync(path.join(__dirname, 'public'));
+        for (const file of publicFiles) {
+            if (file.includes(jobId)) {
+                fs.unlinkSync(path.join(__dirname, 'public', file));
+            }
+        }
+    } catch (e) {}
+
+    return res.json({ message: 'Job record successfully removed.' });
 });
 
 /**
@@ -577,6 +694,93 @@ app.get('/api/jobs/:jobId', requireAuth, (req, res) => {
         return res.status(404).json({ error: 'Job not found.' });
     }
     return res.json(job);
+});
+
+/**
+ * Request step resumption for a suspended/broken job
+ * POST /api/jobs/:jobId/resume
+ * Protected by requireAuth
+ */
+app.post('/api/jobs/:jobId/resume', requireAuth, async (req, res) => {
+    const { jobId } = req.params;
+    const db = loadDB();
+    const job = db.jobs ? db.jobs[jobId] : null;
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found.' });
+    }
+
+    if (job.status !== 'broken' && !job.resumable) {
+        return res.status(400).json({ error: 'Job is not in a resumable/broken state.' });
+    }
+
+    const siteId = job.siteId;
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Associated site not found.' });
+    }
+
+    // Set status back to processing
+    job.status = 'processing';
+    job.progress = job.progress || 10;
+    job.error = null;
+    job.step = 'Resuming pipeline execution...';
+    saveActiveJob(jobId, job);
+
+    const orchestrator = new SafeUpdateOrchestrator(site);
+    const updateParams = { ...job.updateParams, jobId };
+
+    // Launch pipeline in background
+    orchestrator.executeSafeUpdate(
+        updateParams,
+        (progress, step) => {
+            const currentDB = loadDB();
+            if (currentDB.jobs && currentDB.jobs[jobId]) {
+                currentDB.jobs[jobId].progress = progress;
+                currentDB.jobs[jobId].step = step;
+                saveDB(currentDB);
+            }
+        }
+    ).then(result => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'completed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = '✓ Pipeline execution complete! Target updated safely.';
+            currentDB.jobs[jobId].completed = true;
+            currentDB.jobs[jobId].backup_path = result.backup_path || 'S3 Cloud Storage Bucket';
+
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
+            if (sIdx !== -1) {
+                currentDB.sites[sIdx].pendingUpdates = 0;
+                currentDB.sites[sIdx].lastBackupStatus = 'success';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now';
+            }
+            saveDB(currentDB);
+        }
+    }).catch(err => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            if (currentDB.jobs[jobId].status !== 'broken') {
+                currentDB.jobs[jobId].status = 'broken';
+            }
+            currentDB.jobs[jobId].completed = false;
+            currentDB.jobs[jobId].resumable = true;
+            currentDB.jobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
+            currentDB.jobs[jobId].error = err.message;
+
+            const sIdx = currentDB.sites.findIndex(s => s.id === siteId);
+            if (sIdx !== -1) {
+                currentDB.sites[sIdx].lastBackupStatus = 'fail';
+                currentDB.sites[sIdx].lastBackupTime = 'Just now (Error)';
+            }
+            saveDB(currentDB);
+        }
+    });
+
+    return res.json({
+        message: 'Job resumption initiated successfully.',
+        job
+    });
 });
 
 /**
@@ -641,6 +845,7 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
 
     // Generate unique Job ID on the dashboard
     const jobId = 'job_dashboard_' + Date.now();
+    const destination = backup_destination || 's3';
 
     // Initialize job state in tracking map
     const initialJobState = {
@@ -651,18 +856,16 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         step: 'Initializing Pipeline Connection...',
         error: null,
         completed: false,
-        backup_path: ''
+        backup_path: '',
+        updateParams: { type, plugins, backup_destination: destination }
     };
     saveActiveJob(jobId, initialJobState);
 
     const orchestrator = new SafeUpdateOrchestrator(site);
 
-    // Launch pipeline in the background (NON-BLOCKING asynchronous orchestration!)
-    const destination = backup_destination || 's3';
-
     // We execute the promise in the background without holding the HTTP response thread
     orchestrator.executeSafeUpdate(
-        { type, plugins, backup_destination: destination },
+        { jobId, type, plugins, backup_destination: destination },
         (progress, step) => {
             // Progress Callback: Update active jobs tracking map in real-time
             const currentDB = loadDB();
@@ -695,10 +898,13 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         // On Failure
         const currentDB = loadDB();
         if (currentDB.jobs && currentDB.jobs[jobId]) {
-            currentDB.jobs[jobId].status = 'failed';
+            if (currentDB.jobs[jobId].status !== 'broken') {
+                currentDB.jobs[jobId].status = 'broken';
+            }
+            currentDB.jobs[jobId].completed = false;
+            currentDB.jobs[jobId].resumable = true;
             currentDB.jobs[jobId].step = `⚠️ Pipeline failed: ${err.message}`;
             currentDB.jobs[jobId].error = err.message;
-            currentDB.jobs[jobId].completed = true;
 
             // Update database metrics dynamically
             const sIdx = currentDB.sites.findIndex(s => s.id === siteId);

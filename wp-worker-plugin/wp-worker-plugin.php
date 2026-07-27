@@ -122,6 +122,12 @@ class WPCentral_Worker_Controller {
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
 
+        register_rest_route('wp-central/v1', '/job-control', array(
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => array($this, 'handle_job_control'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
+
         register_rest_route('wp-central/v1', '/update', array(
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => array($this, 'handle_updates'),
@@ -139,6 +145,28 @@ class WPCentral_Worker_Controller {
             'callback'            => array($this, 'get_wp_status'),
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
+    }
+
+    /**
+     * Job Control Endpoint (Pause, Kill)
+     * POST /wp-json/wp-central/v1/job-control
+     */
+    public function handle_job_control(WP_REST_Request $request) {
+        $params = $request->get_json_params();
+        $job_id = sanitize_text_field($params['job_id']);
+        $action = sanitize_text_field($params['action']); // 'pause' or 'kill'
+
+        $job_data = get_option('wp_central_job_' . $job_id);
+        if ($job_data) {
+            if ($action === 'pause') {
+                $job_data['status'] = 'paused';
+            } elseif ($action === 'kill') {
+                $job_data['status'] = 'killed';
+            }
+            update_option('wp_central_job_' . $job_id, $job_data);
+            return new WP_REST_Response(array('status' => 'ok', 'job' => $job_data), 200);
+        }
+        return new WP_Error('job_not_found', __('The specified background job was not found.', 'wp-central'), array('status' => 404));
     }
 
     /**
@@ -294,6 +322,19 @@ public function get_wp_status(WP_REST_Request $request) {
     }
 
     /**
+     * Check if a job has been paused or killed.
+     * Throws an exception to abort/suspend execution gracefully.
+     */
+    private function check_job_cancelled($job_id) {
+        $job_data = get_option('wp_central_job_' . $job_id);
+        if ($job_data) {
+            if ($job_data['status'] === 'paused' || $job_data['status'] === 'killed') {
+                throw new Exception("JOB_CANCELLED_OR_PAUSED");
+            }
+        }
+    }
+
+    /**
      * Core backup runner logic
      */
     private function run_backup_process_inline($job_id) {
@@ -333,15 +374,21 @@ public function get_wp_status(WP_REST_Request $request) {
                 }
             }
 
+            $this->check_job_cancelled($job_id);
+
             // Step 1: Database Export
             $this->export_database($sql_filepath);
             $job_data['progress'] = 40;
             update_option('wp_central_job_' . $job_id, $job_data);
 
+            $this->check_job_cancelled($job_id);
+
             // Step 2: Zip /wp-content/ directory
             $this->zip_wp_content($zip_filepath, $sql_filepath, $temp_dir);
             $job_data['progress'] = 70;
             update_option('wp_central_job_' . $job_id, $job_data);
+
+            $this->check_job_cancelled($job_id);
 
             if ($destination === 's3') {
                 // Step 3: Upload to S3
@@ -377,6 +424,10 @@ public function get_wp_status(WP_REST_Request $request) {
             return true;
         } catch (Throwable $e) {
             $this->recursive_cleanup($temp_dir);
+            if ($e->getMessage() === 'JOB_CANCELLED_OR_PAUSED') {
+                return false;
+            }
+
             $formatted_error = sprintf(
                 "PHP Exception: %s inside file %s at line %d",
                 $e->getMessage(),
@@ -591,85 +642,225 @@ public function get_wp_status(WP_REST_Request $request) {
     }
 
     /**
+     * Helper to check if CLI command execution is allowed/enabled on this server.
+     */
+    private function is_exec_enabled() {
+        if (!function_exists('exec')) {
+            return false;
+        }
+        $disabled_str = ini_get('disable_functions');
+        if (empty($disabled_str)) {
+            return true;
+        }
+        $disabled = array_map('trim', explode(',', $disabled_str));
+        return !in_array('exec', $disabled) && !in_array('shell_exec', $disabled);
+    }
+
+    /**
      * Database Dumper
      */
-   private function export_database($filepath) {
-    global $wpdb;
-    $tables = $wpdb->get_col("SHOW TABLES");
-    $handle = fopen($filepath, 'w');
-    if (!$handle) {
-        throw new Exception("Unable to open SQL file for writing at: " . $filepath);
-    }
+    private function export_database($filepath) {
+        global $wpdb;
 
-    fwrite($handle, "-- WP Central Database Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n\n");
+        // Fast Path: Check if native CLI execution is allowed/enabled, and run optimized mysqldump
+        if ($this->is_exec_enabled()) {
+            $host_parts = explode(':', DB_HOST);
+            $db_host = $host_parts[0];
+            $db_port = isset($host_parts[1]) ? $host_parts[1] : '';
 
-    foreach ($tables as $table) {
-        $create_table = $wpdb->get_row("SHOW CREATE TABLE `$table`", ARRAY_N);
-        fwrite($handle, "DROP TABLE IF EXISTS `$table`;\n" . $create_table[1] . ";\n\n");
+            $cmd = 'mysqldump';
+            if (!empty($db_host)) {
+                $cmd .= ' -h ' . escapeshellarg($db_host);
+            }
+            if (!empty($db_port) && is_numeric($db_port)) {
+                $cmd .= ' -P ' . escapeshellarg($db_port);
+            }
+            $cmd .= ' -u ' . escapeshellarg(DB_USER);
+            if (defined('DB_PASSWORD') && !empty(DB_PASSWORD)) {
+                $cmd .= ' -p' . escapeshellarg(DB_PASSWORD);
+            }
+            $cmd .= ' --single-transaction --quick --opt ' . escapeshellarg(DB_NAME) . ' > ' . escapeshellarg($filepath);
 
-        $count = $wpdb->get_var("SELECT COUNT(*) FROM `$table`");
-        $chunk_size = 500;
-
-        for ($offset = 0; $offset < $count; $offset += $chunk_size) {
-            $rows = $wpdb->get_results("SELECT * FROM `$table` LIMIT $chunk_size OFFSET $offset", ARRAY_A);
-            foreach ($rows as $row) {
-                $escaped_values = array_map(function($val) {
-                    return is_null($val) ? 'NULL' : "'" . esc_sql($val) . "'";
-                }, array_values($row));
-                
-                $keys = array_map(function($k) { return "`$k`"; }, array_keys($row));
-                fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES (" . implode(', ', $escaped_values) . ");\n");
+            exec($cmd, $output, $return_var);
+            if ($return_var === 0 && file_exists($filepath) && filesize($filepath) > 0) {
+                return true; // Fast path successful!
             }
         }
-        fwrite($handle, "\n\n");
+
+        // Optimized Pure-PHP SQL Exporter Fallback
+        $wpdb->save_queries = false;
+        $wpdb->suppress_errors(true);
+
+        $tables = $wpdb->get_col("SHOW TABLES");
+        $handle = fopen($filepath, 'w');
+        if (!$handle) {
+            throw new Exception("Unable to open SQL file for writing at: " . $filepath);
+        }
+
+        fwrite($handle, "-- WP Central Database Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n\n");
+        fwrite($handle, "SET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\nSET AUTOCOMMIT = 0;\n\n");
+
+        foreach ($tables as $table) {
+            $create_table = $wpdb->get_row("SHOW CREATE TABLE `$table`", ARRAY_N);
+            fwrite($handle, "DROP TABLE IF EXISTS `$table`;\n" . $create_table[1] . ";\n\n");
+
+            // Identify the primary key and verify if it's numeric for Primary Key pagination
+            $primary_key = '';
+            $is_numeric_pk = false;
+            $col_info = $wpdb->get_results("SHOW COLUMNS FROM `$table`", ARRAY_A);
+            if (!empty($col_info)) {
+                foreach ($col_info as $col) {
+                    if ($col['Key'] === 'PRI') {
+                        $primary_key = $col['Field'];
+                        $type = strtolower($col['Type']);
+                        if (strpos($type, 'int') !== false || strpos($type, 'decimal') !== false || strpos($type, 'num') !== false) {
+                            $is_numeric_pk = true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (!empty($primary_key) && $is_numeric_pk) {
+                // Primary Key Range Query Pagination (No OFFSET)
+                $last_id = 0;
+                $batch_values = array();
+                $keys = array();
+
+                while (true) {
+                    $rows = $wpdb->get_results($wpdb->prepare(
+                        "SELECT * FROM `$table` WHERE `$primary_key` > %d ORDER BY `$primary_key` ASC LIMIT 2000",
+                        $last_id
+                    ), ARRAY_A);
+
+                    if (empty($rows)) {
+                        break;
+                    }
+
+                    foreach ($rows as $row) {
+                        if (empty($keys)) {
+                            $keys = array_map(function($k) { return "`$k`"; }, array_keys($row));
+                        }
+                        $escaped_values = array_map(function($val) {
+                            return is_null($val) ? 'NULL' : "'" . esc_sql($val) . "'";
+                        }, array_values($row));
+                        $batch_values[] = "(" . implode(', ', $escaped_values) . ")";
+
+                        if (count($batch_values) >= 1000) {
+                            fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES " . implode(', ', $batch_values) . ";\n");
+                            $batch_values = array();
+                        }
+                    }
+
+                    $last_row = end($rows);
+                    $last_id = intval($last_row[$primary_key]);
+                }
+
+                if (!empty($batch_values)) {
+                    fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES " . implode(', ', $batch_values) . ";\n");
+                }
+            } else {
+                // Standard offset chunk fallback if no numeric PRI is found
+                $count = $wpdb->get_var("SELECT COUNT(*) FROM `$table`");
+                $chunk_size = 1000;
+                $batch_values = array();
+                $keys = array();
+
+                for ($offset = 0; $offset < $count; $offset += $chunk_size) {
+                    $rows = $wpdb->get_results("SELECT * FROM `$table` LIMIT $chunk_size OFFSET $offset", ARRAY_A);
+                    foreach ($rows as $row) {
+                        if (empty($keys)) {
+                            $keys = array_map(function($k) { return "`$k`"; }, array_keys($row));
+                        }
+                        $escaped_values = array_map(function($val) {
+                            return is_null($val) ? 'NULL' : "'" . esc_sql($val) . "'";
+                        }, array_values($row));
+                        $batch_values[] = "(" . implode(', ', $escaped_values) . ")";
+
+                        if (count($batch_values) >= 1000) {
+                            fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES " . implode(', ', $batch_values) . ";\n");
+                            $batch_values = array();
+                        }
+                    }
+                }
+
+                if (!empty($batch_values)) {
+                    fwrite($handle, "INSERT INTO `$table` (" . implode(', ', $keys) . ") VALUES " . implode(', ', $batch_values) . ";\n");
+                }
+            }
+            fwrite($handle, "\n\n");
+        }
+
+        fwrite($handle, "COMMIT;\nSET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n");
+        fclose($handle);
     }
-    fclose($handle);
-}
 
     /**
      * Zip recursive worker excluding workspace directory
      */
     private function zip_wp_content($zip_filepath, $sql_filepath, $exclude_dir) {
-    if (!class_exists('ZipArchive')) {
-        throw new Exception("ZipArchive PHP extension is not installed on this server.");
-    }
+        // Fast Path: Check if native CLI zip is allowed/enabled and run it
+        if ($this->is_exec_enabled()) {
+            exec('which zip', $out, $code);
+            if ($code === 0) {
+                $parent_dir = dirname(WP_CONTENT_DIR);
+                $wp_content_dirname = basename(WP_CONTENT_DIR);
 
-    $zip = new ZipArchive();
-    if ($zip->open($zip_filepath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-        throw new Exception("Could not create ZIP archive at: " . $zip_filepath);
-    }
+                // Exclude temp backups directories relative to parent of wp-content
+                $cmd = 'cd ' . escapeshellarg($parent_dir) . ' && zip -r ' . escapeshellarg($zip_filepath) . ' ' . escapeshellarg($wp_content_dirname) . ' -x "' . $wp_content_dirname . '/uploads/*"';
+                exec($cmd, $output, $return_var);
 
-    $wp_content_dir = wp_normalize_path(rtrim(WP_CONTENT_DIR, '/\\'));
-    $norm_exclude_dir = wp_normalize_path($exclude_dir);
-    $norm_backups_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
-    $norm_uploads_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads');
-
-    $files = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::LEAVES_ONLY
-    );
-
-    foreach ($files as $file) {
-        if (!$file->isDir()) {
-            $real_path = wp_normalize_path($file->getRealPath());
-
-            // Skip current temp directory, local backup vault, and the heavy uploads folder
-            if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0 || strpos($real_path, $norm_uploads_dir) === 0)) {
-                continue;
+                if ($return_var === 0 && file_exists($zip_filepath) && filesize($zip_filepath) > 0) {
+                    $cmd_sql = 'zip -j ' . escapeshellarg($zip_filepath) . ' ' . escapeshellarg($sql_filepath);
+                    exec($cmd_sql, $output_sql, $return_var_sql);
+                    if ($return_var_sql === 0) {
+                        return true; // Fast path archive successful!
+                    }
+                }
             }
-
-            if (!is_readable($real_path)) {
-                continue;
-            }
-
-            $relative_path = substr($real_path, strlen($wp_content_dir) + 1);
-            $zip->addFile($real_path, 'wp-content/' . $relative_path);
         }
-    }
 
-    $zip->addFile($sql_filepath, 'database_dump.sql');
-    $zip->close();
-}
+        // Pure PHP ZipArchive Fallback
+        if (!class_exists('ZipArchive')) {
+            throw new Exception("ZipArchive PHP extension is not installed on this server.");
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($zip_filepath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            throw new Exception("Could not create ZIP archive at: " . $zip_filepath);
+        }
+
+        $wp_content_dir = wp_normalize_path(rtrim(WP_CONTENT_DIR, '/\\'));
+        $norm_exclude_dir = wp_normalize_path($exclude_dir);
+        $norm_backups_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
+        $norm_uploads_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads');
+
+        $files = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+
+        foreach ($files as $file) {
+            if (!$file->isDir()) {
+                $real_path = wp_normalize_path($file->getRealPath());
+
+                // Skip current temp directory, local backup vault, and the heavy uploads folder
+                if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0 || strpos($real_path, $norm_uploads_dir) === 0)) {
+                    continue;
+                }
+
+                if (!is_readable($real_path)) {
+                    continue;
+                }
+
+                $relative_path = substr($real_path, strlen($wp_content_dir) + 1);
+                $zip->addFile($real_path, 'wp-content/' . $relative_path);
+            }
+        }
+
+        $zip->addFile($sql_filepath, 'database_dump.sql');
+        $zip->close();
+    }
 
     /**
      * AWS Signature V4 S3 client
