@@ -65,12 +65,14 @@ class SafeUpdateOrchestrator {
 
     /**
      * Poll Job Status on Worker Plugin until backup process completes or fails.
+     * Runs endlessly without timeout caps as long as progress updates.
      */
-    async pollBackupStatus(jobId, onStep, intervalMs = 2500, timeoutMs = 600000) {
+    async pollBackupStatus(jobId, onStep, intervalMs = 2500) {
         console.log(`[Backup Poller] Polling status for job: ${jobId}`);
-        const startTime = Date.now();
+        let lastProgress = -1;
+        let lastUpdateTime = Date.now();
 
-        while (Date.now() - startTime < timeoutMs) {
+        while (true) {
             try {
                 const response = await this.signedGet('/wp-json/wp-central/v1/job-status', { job_id: jobId });
                 const job = response.data;
@@ -92,14 +94,19 @@ class SafeUpdateOrchestrator {
                 if (job.status === 'failed') {
                     throw new Error(`Backup worker failed with error: ${job.error}`);
                 }
+
+                if (job.progress !== lastProgress) {
+                    lastProgress = job.progress;
+                    lastUpdateTime = Date.now();
+                } else if (Date.now() - lastUpdateTime > 3600000) { // 1 hour stall safeguard
+                    throw new Error('Backup progress stalled for more than 1 hour.');
+                }
             } catch (err) {
                 console.warn(`[Backup Poller] Warn: Status poll failed temporarily. Error: ${err.message}`);
             }
 
             await new Promise(resolve => setTimeout(resolve, intervalMs));
         }
-
-        throw new Error('Backup polling reached maximum timeout limit.');
     }
 
     /**
