@@ -191,6 +191,26 @@ class SafeUpdateOrchestrator {
     }
 
     /**
+     * Check if a job has been paused or killed.
+     * Throws an exception to abort/suspend execution gracefully.
+     */
+    checkJobCancelled(jobId) {
+        if (!jobId) return 'processing';
+        const db = this.loadDB();
+        const job = db.jobs && db.jobs[jobId];
+        if (job) {
+            if (job.status === 'paused') {
+                throw new Error('JOB_PAUSED');
+            }
+            if (job.status === 'killed') {
+                throw new Error('JOB_KILLED');
+            }
+            return job.status;
+        }
+        return 'processing';
+    }
+
+    /**
      * Orchestrator execution entry point with state checkpointing & resumption.
      * Performs a granular 6-step update sequence.
      *
@@ -218,6 +238,7 @@ class SafeUpdateOrchestrator {
         try {
             // STEP 1: STEP_01_BACKUP_INITIATED
             if (!lastCompletedStep) {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 1: Triggering Remote Backup ---');
                 if (onStep) onStep(15, 'Triggering target backup execution on target...');
 
@@ -250,11 +271,13 @@ class SafeUpdateOrchestrator {
 
             // STEP 2: STEP_02_BACKUP_COMPLETED
             if (lastCompletedStep === 'STEP_01_BACKUP_INITIATED') {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 2: Completing Remote Backup ---');
                 if (onStep) onStep(35, 'Polling target backup execution status...');
 
                 const remote_job_id = stepData.remoteBackupJobId;
                 const backupJob = await this.pollBackupStatus(remote_job_id, (remoteProgress, msg) => {
+                    this.checkJobCancelled(jobId);
                     const mappedProgress = Math.round(25 + (remoteProgress * 0.2));
                     if (onStep) onStep(mappedProgress, `Polling backup status: ${msg}`);
                 });
@@ -275,6 +298,7 @@ class SafeUpdateOrchestrator {
 
             // STEP 3: STEP_03_PRE_SCREENSHOT
             if (lastCompletedStep === 'STEP_02_BACKUP_COMPLETED') {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 3: Capturing Pre-Update visual state ---');
                 if (onStep) onStep(55, 'Capturing pre-update visual state via headless browser simulation...');
 
@@ -297,6 +321,7 @@ class SafeUpdateOrchestrator {
 
             // STEP 4: STEP_04_UPDATES_APPLIED
             if (lastCompletedStep === 'STEP_03_PRE_SCREENSHOT') {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 4: Applying Core/Plugin Updates ---');
                 if (onStep) onStep(70, 'Applying Core/Plugin updates via WordPress upgrader routines...');
 
@@ -387,6 +412,7 @@ class SafeUpdateOrchestrator {
 
             // STEP 5: STEP_05_POST_SCREENSHOT
             if (lastCompletedStep === 'STEP_04_UPDATES_APPLIED') {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 5: Capturing Post-Update visual state ---');
                 if (onStep) onStep(85, 'Capturing post-update visual state via headless browser simulation...');
 
@@ -409,6 +435,7 @@ class SafeUpdateOrchestrator {
 
             // STEP 6: STEP_06_VISUAL_COMPARISON
             if (lastCompletedStep === 'STEP_05_POST_SCREENSHOT') {
+                this.checkJobCancelled(jobId);
                 console.log('\n--- Step 6: Performing visual comparison ---');
                 if (onStep) onStep(95, 'Performing pixel-level visual comparison analysis...');
 
@@ -437,6 +464,24 @@ class SafeUpdateOrchestrator {
             };
 
         } catch (error) {
+            if (error.message === 'JOB_PAUSED') {
+                console.log(`[Orchestrator] Job ${jobId} paused at boundary checkpoint gracefully.`);
+                return { success: false, message: 'Job paused.' };
+            }
+            if (error.message === 'JOB_KILLED') {
+                console.log(`[Orchestrator] Job ${jobId} terminated mid-execution. Cleaning up resources...`);
+                try {
+                    const publicDir = path.join(__dirname, 'public');
+                    const files = fs.readdirSync(publicDir);
+                    for (const f of files) {
+                        if (f.includes(jobId)) {
+                            fs.unlinkSync(path.join(publicDir, f));
+                        }
+                    }
+                } catch (e) {}
+                return { success: false, message: 'Job killed.' };
+            }
+
             console.error('\n[FATAL PIPELINE FAILURE]', error.message);
             if (error.response) {
                 console.error('Server responded with:', error.response.status, error.response.data);

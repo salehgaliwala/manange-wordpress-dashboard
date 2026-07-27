@@ -122,6 +122,12 @@ class WPCentral_Worker_Controller {
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
 
+        register_rest_route('wp-central/v1', '/job-control', array(
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => array($this, 'handle_job_control'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
+
         register_rest_route('wp-central/v1', '/update', array(
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => array($this, 'handle_updates'),
@@ -139,6 +145,28 @@ class WPCentral_Worker_Controller {
             'callback'            => array($this, 'get_wp_status'),
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
+    }
+
+    /**
+     * Job Control Endpoint (Pause, Kill)
+     * POST /wp-json/wp-central/v1/job-control
+     */
+    public function handle_job_control(WP_REST_Request $request) {
+        $params = $request->get_json_params();
+        $job_id = sanitize_text_field($params['job_id']);
+        $action = sanitize_text_field($params['action']); // 'pause' or 'kill'
+
+        $job_data = get_option('wp_central_job_' . $job_id);
+        if ($job_data) {
+            if ($action === 'pause') {
+                $job_data['status'] = 'paused';
+            } elseif ($action === 'kill') {
+                $job_data['status'] = 'killed';
+            }
+            update_option('wp_central_job_' . $job_id, $job_data);
+            return new WP_REST_Response(array('status' => 'ok', 'job' => $job_data), 200);
+        }
+        return new WP_Error('job_not_found', __('The specified background job was not found.', 'wp-central'), array('status' => 404));
     }
 
     /**
@@ -294,6 +322,19 @@ public function get_wp_status(WP_REST_Request $request) {
     }
 
     /**
+     * Check if a job has been paused or killed.
+     * Throws an exception to abort/suspend execution gracefully.
+     */
+    private function check_job_cancelled($job_id) {
+        $job_data = get_option('wp_central_job_' . $job_id);
+        if ($job_data) {
+            if ($job_data['status'] === 'paused' || $job_data['status'] === 'killed') {
+                throw new Exception("JOB_CANCELLED_OR_PAUSED");
+            }
+        }
+    }
+
+    /**
      * Core backup runner logic
      */
     private function run_backup_process_inline($job_id) {
@@ -333,15 +374,21 @@ public function get_wp_status(WP_REST_Request $request) {
                 }
             }
 
+            $this->check_job_cancelled($job_id);
+
             // Step 1: Database Export
             $this->export_database($sql_filepath);
             $job_data['progress'] = 40;
             update_option('wp_central_job_' . $job_id, $job_data);
 
+            $this->check_job_cancelled($job_id);
+
             // Step 2: Zip /wp-content/ directory
             $this->zip_wp_content($zip_filepath, $sql_filepath, $temp_dir);
             $job_data['progress'] = 70;
             update_option('wp_central_job_' . $job_id, $job_data);
+
+            $this->check_job_cancelled($job_id);
 
             if ($destination === 's3') {
                 // Step 3: Upload to S3
@@ -377,6 +424,10 @@ public function get_wp_status(WP_REST_Request $request) {
             return true;
         } catch (Throwable $e) {
             $this->recursive_cleanup($temp_dir);
+            if ($e->getMessage() === 'JOB_CANCELLED_OR_PAUSED') {
+                return false;
+            }
+
             $formatted_error = sprintf(
                 "PHP Exception: %s inside file %s at line %d",
                 $e->getMessage(),
