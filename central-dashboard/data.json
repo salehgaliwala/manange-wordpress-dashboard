@@ -31,7 +31,7 @@
       "version": "2.1.4",
       "author": "Vault Development Corp",
       "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-28T04:53:20.715Z"
+      "uploadedAt": "2026-07-28T05:55:46.875Z"
     }
   },
   "jobs": {
@@ -310,6 +310,28 @@
       "stepDescription": "⚠️ Pipeline broken: ",
       "resumable": true,
       "updatedAt": "2026-07-28T04:53:20.740Z"
+    },
+    "job_dashboard_1785218146886": {
+      "id": "job_dashboard_1785218146886",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "skip_backup": false,
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3",
+        "skip_backup": false
+      },
+      "stepDescription": "⚠️ Pipeline broken: ",
+      "resumable": true,
+      "updatedAt": "2026-07-28T05:55:46.919Z"
     }
   }
 }
