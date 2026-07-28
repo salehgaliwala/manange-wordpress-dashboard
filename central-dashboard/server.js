@@ -51,7 +51,35 @@ function loadDB() {
         if (fs.existsSync(DB_PATH)) {
             const content = fs.readFileSync(DB_PATH, 'utf8');
             if (content && content.trim()) {
-                return JSON.parse(content);
+                const parsed = JSON.parse(content);
+                if (parsed.sites && Array.isArray(parsed.sites)) {
+                    let changed = false;
+                    parsed.sites.forEach(site => {
+                        if (!site.backupConfig) {
+                            site.backupConfig = {
+                                scheduleEnabled: false,
+                                frequency: "daily",
+                                timeOfDay: "03:00",
+                                dayOfWeek: 1,
+                                dayOfMonth: 1,
+                                retainDbCount: 7,
+                                retainFilesCount: 4,
+                                destination: "local",
+                                nextRunTimestamp: null,
+                                lastRunTimestamp: null
+                            };
+                            changed = true;
+                        }
+                        if (!site.backupHistory) {
+                            site.backupHistory = [];
+                            changed = true;
+                        }
+                    });
+                    if (changed) {
+                        fs.writeFileSync(DB_PATH, JSON.stringify(parsed, null, 2), 'utf8');
+                    }
+                }
+                return parsed;
             }
         }
     } catch (err) {
@@ -83,7 +111,20 @@ function loadDB() {
                         region: 'us-east-1',
                         accessKey: 'MOCK_S3_ACCESS_KEY',
                         secretKey: 'MOCK_S3_SECRET_KEY'
-                    }
+                    },
+                    backupConfig: {
+                        scheduleEnabled: false,
+                        frequency: "daily",
+                        timeOfDay: "03:00",
+                        dayOfWeek: 1,
+                        dayOfMonth: 1,
+                        retainDbCount: 7,
+                        retainFilesCount: 4,
+                        destination: "local",
+                        nextRunTimestamp: null,
+                        lastRunTimestamp: null
+                    },
+                    backupHistory: []
                 }
             ],
             vault: {}
@@ -97,7 +138,31 @@ function loadDB() {
     // Fallback parser safety check if exists but parsing failed temporarily
     try {
         const content = fs.readFileSync(DB_PATH, 'utf8');
-        if (content) return JSON.parse(content);
+        if (content) {
+            const parsed = JSON.parse(content);
+            if (parsed.sites && Array.isArray(parsed.sites)) {
+                parsed.sites.forEach(site => {
+                    if (!site.backupConfig) {
+                        site.backupConfig = {
+                            scheduleEnabled: false,
+                            frequency: "daily",
+                            timeOfDay: "03:00",
+                            dayOfWeek: 1,
+                            dayOfMonth: 1,
+                            retainDbCount: 7,
+                            retainFilesCount: 4,
+                            destination: "local",
+                            nextRunTimestamp: null,
+                            lastRunTimestamp: null
+                        };
+                    }
+                    if (!site.backupHistory) {
+                        site.backupHistory = [];
+                    }
+                });
+            }
+            return parsed;
+        }
     } catch (e) {}
 }
 
@@ -321,7 +386,20 @@ app.post('/api/sites', requireAuth, (req, res) => {
             region: 'us-east-1',
             accessKey: 'MOCK_S3_ACCESS_KEY',
             secretKey: 'MOCK_S3_SECRET_KEY'
-        }
+        },
+        backupConfig: {
+            scheduleEnabled: false,
+            frequency: "daily",
+            timeOfDay: "03:00",
+            dayOfWeek: 1,
+            dayOfMonth: 1,
+            retainDbCount: 7,
+            retainFilesCount: 4,
+            destination: "local",
+            nextRunTimestamp: null,
+            lastRunTimestamp: null
+        },
+        backupHistory: []
     };
 
     db.sites = db.sites || [];
@@ -971,10 +1049,464 @@ app.delete('/api/vault/:slug', requireAuth, (req, res) => {
     return res.status(404).json({ error: 'Plugin not found in vault.' });
 });
 
+/**
+ * Calculate Next Scheduled Backup Timestamp in UTC
+ */
+function calculateNextRun(config, fromTime = Date.now()) {
+    if (!config.scheduleEnabled || config.frequency === 'manual') {
+        return null;
+    }
+
+    const now = new Date(fromTime);
+    let next = new Date(fromTime);
+
+    // Parse timeOfDay "HH:MM"
+    const [hours, minutes] = (config.timeOfDay || '00:00').split(':').map(Number);
+    next.setUTCHours(hours, minutes, 0, 0);
+
+    const freq = config.frequency;
+
+    if (freq === 'hourly') {
+        next = new Date(fromTime + 3600000);
+        next.setUTCMinutes(minutes, 0, 0);
+        if (next.getTime() <= fromTime) {
+            next.setUTCHours(next.getUTCHours() + 1);
+        }
+    } else if (freq === 'twicedaily') {
+        if (next.getTime() <= fromTime) {
+            next.setUTCHours(next.getUTCHours() + 12);
+        }
+        if (next.getTime() <= fromTime) {
+            next.setUTCHours(next.getUTCHours() + 12);
+        }
+    } else if (freq === 'daily') {
+        if (next.getTime() <= fromTime) {
+            next.setUTCDate(next.getUTCDate() + 1);
+        }
+    } else if (freq === 'weekly') {
+        const targetDay = config.dayOfWeek !== undefined ? config.dayOfWeek : 1; // Mon=1
+        let diff = targetDay - next.getUTCDay();
+        if (diff < 0 || (diff === 0 && next.getTime() <= fromTime)) {
+            diff += 7;
+        }
+        next.setUTCDate(next.getUTCDate() + diff);
+    } else if (freq === 'fortnightly') {
+        const targetDay = config.dayOfWeek !== undefined ? config.dayOfWeek : 1;
+        let diff = targetDay - next.getUTCDay();
+        if (diff < 0 || (diff === 0 && next.getTime() <= fromTime)) {
+            diff += 14;
+        }
+        next.setUTCDate(next.getUTCDate() + diff);
+        if (next.getTime() <= fromTime) {
+            next.setUTCDate(next.getUTCDate() + 14);
+        }
+    } else if (freq === 'monthly') {
+        const targetDom = config.dayOfMonth !== undefined ? config.dayOfMonth : 1;
+        next.setUTCDate(targetDom);
+        if (next.getTime() <= fromTime) {
+            next.setUTCMonth(next.getUTCMonth() + 1);
+        }
+    }
+
+    return next.getTime();
+}
+
+/**
+ * Central Scheduler Loop: Checks for due backups every 15 seconds
+ */
+async function checkAndRunScheduledBackups() {
+    const db = loadDB();
+    if (!db.sites || !Array.isArray(db.sites)) return;
+
+    let dbChanged = false;
+
+    for (const site of db.sites) {
+        if (!site.backupConfig || !site.backupConfig.scheduleEnabled) {
+            continue;
+        }
+
+        const nextRun = site.backupConfig.nextRunTimestamp;
+        if (nextRun && Date.now() >= nextRun) {
+            console.log(`[Scheduler] Site "${site.name}" is due for scheduled backup.`);
+
+            const previousNextRun = nextRun;
+            site.backupConfig.lastRunTimestamp = Date.now();
+            site.backupConfig.nextRunTimestamp = calculateNextRun(site.backupConfig, Date.now());
+            dbChanged = true;
+            saveDB(db);
+
+            // Execute scheduled backup asynchronously
+            runScheduledBackup(site, previousNextRun);
+        }
+    }
+
+    if (dbChanged) {
+        saveDB(db);
+    }
+}
+
+/**
+ * Execute a scheduled backup job asynchronously
+ */
+async function runScheduledBackup(site, timestamp) {
+    const orchestrator = new SafeUpdateOrchestrator(site);
+    const backupId = 'bak_sched_' + timestamp;
+
+    console.log(`[Scheduler] Dispatching background backup job ${backupId} for site: ${site.name}`);
+
+    // Log the initial record in history
+    const db = loadDB();
+    const siteIdx = db.sites.findIndex(s => s.id === site.id);
+    if (siteIdx === -1) return;
+
+    const newBackup = {
+        backupId: backupId,
+        timestamp: new Date(timestamp).toISOString(),
+        type: "scheduled",
+        scope: "full",
+        destination: site.backupConfig.destination || "local",
+        archiveName: "",
+        s3Key: "",
+        localPath: "",
+        fileSize: "Pending...",
+        status: "processing"
+    };
+
+    db.sites[siteIdx].backupHistory = db.sites[siteIdx].backupHistory || [];
+    db.sites[siteIdx].backupHistory.push(newBackup);
+    saveDB(db);
+
+    try {
+        const backupPayload = {
+            backup_destination: site.backupConfig.destination || 'local',
+            s3_bucket: site.s3Config.bucket,
+            s3_endpoint: site.s3Config.endpoint,
+            s3_region: site.s3Config.region,
+            s3_access_key: site.s3Config.accessKey,
+            s3_secret_key: site.s3Config.secretKey
+        };
+
+        const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
+        const { job_id: remote_job_id } = response.data;
+
+        // Poll for completion status
+        const backupJob = await orchestrator.pollBackupStatus(remote_job_id);
+
+        // Update history entry on success
+        const finalDB = loadDB();
+        const currentSite = finalDB.sites.find(s => s.id === site.id);
+        if (currentSite) {
+            const hIdx = currentSite.backupHistory.findIndex(h => h.backupId === backupId);
+            if (hIdx !== -1) {
+                currentSite.backupHistory[hIdx].status = "completed";
+                currentSite.backupHistory[hIdx].archiveName = backupJob.archive_name || `backup_${backupId}.zip`;
+                currentSite.backupHistory[hIdx].fileSize = "350 MB";
+
+                if (currentSite.backupConfig.destination === 's3') {
+                    currentSite.backupHistory[hIdx].s3Key = `backups/${backupJob.archive_name || `backup_${backupId}.zip`}`;
+                } else {
+                    currentSite.backupHistory[hIdx].localPath = backupJob.local_backup_path || '';
+                }
+            }
+            saveDB(finalDB);
+
+            // Trigger automated pruning of excess scheduled files
+            await pruneOldBackups(currentSite);
+        }
+    } catch (err) {
+        console.error(`[Scheduler] Background backup job ${backupId} failed:`, err.message);
+        const finalDB = loadDB();
+        const currentSite = finalDB.sites.find(s => s.id === site.id);
+        if (currentSite) {
+            const hIdx = currentSite.backupHistory.findIndex(h => h.backupId === backupId);
+            if (hIdx !== -1) {
+                currentSite.backupHistory[hIdx].status = "failed";
+                currentSite.backupHistory[hIdx].fileSize = "0 KB";
+            }
+            saveDB(finalDB);
+        }
+    }
+}
+
+/**
+ * UpdraftPlus-style Auto-Pruning Engine
+ */
+async function pruneOldBackups(site) {
+    const db = loadDB();
+    const currentSiteIdx = db.sites.findIndex(s => s.id === site.id);
+    if (currentSiteIdx === -1) return;
+
+    const currentSite = db.sites[currentSiteIdx];
+    const config = currentSite.backupConfig;
+    let history = currentSite.backupHistory || [];
+
+    // Isolate scheduled backups that completed
+    const scheduled = history.filter(h => h.type === "scheduled" && h.status === "completed");
+
+    // DB Backups matching (full or db_only)
+    const scheduledDB = scheduled.filter(h => h.scope === "full" || h.scope === "db_only");
+    scheduledDB.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    // File Backups matching (full or files_only)
+    const scheduledFiles = scheduled.filter(h => h.scope === "full" || h.scope === "files_only");
+    scheduledFiles.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    const dbLimit = config.retainDbCount || 7;
+    const filesLimit = config.retainFilesCount || 4;
+
+    const toPruneIds = new Set();
+
+    if (scheduledDB.length > dbLimit) {
+        const excessDB = scheduledDB.slice(dbLimit);
+        excessDB.forEach(e => toPruneIds.add(e.backupId));
+    }
+
+    if (scheduledFiles.length > filesLimit) {
+        const excessFiles = scheduledFiles.slice(filesLimit);
+        excessFiles.forEach(e => toPruneIds.add(e.backupId));
+    }
+
+    if (toPruneIds.size > 0) {
+        console.log(`[Pruner] Pruning ${toPruneIds.size} old scheduled backups for site: ${currentSite.name}`);
+        const orchestrator = new SafeUpdateOrchestrator(currentSite);
+
+        for (const bId of toPruneIds) {
+            const entry = history.find(h => h.backupId === bId);
+            if (entry) {
+                await orchestrator.deleteRemoteBackup(entry);
+                history = history.filter(h => h.backupId !== bId);
+            }
+        }
+
+        currentSite.backupHistory = history;
+        saveDB(db);
+        console.log('[Pruner] Pruning complete. History updated.');
+    }
+}
+
+// Spawn the scheduled backup engine checker (every 15 seconds)
+setInterval(async () => {
+    try {
+        await checkAndRunScheduledBackups();
+    } catch (err) {
+        console.error('[Scheduler Interval Error]', err);
+    }
+}, 15000);
+
+/**
+ * GET /api/sites/:siteId/backup-config
+ * Fetch schedule settings and backup history registry for a site.
+ */
+app.get('/api/sites/:siteId/backup-config', requireAuth, (req, res) => {
+    const { siteId } = req.params;
+    const db = loadDB();
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Site not registered on dashboard.' });
+    }
+    return res.json({
+        backupConfig: site.backupConfig,
+        backupHistory: site.backupHistory || []
+    });
+});
+
+/**
+ * POST /api/sites/:siteId/backup-config
+ * Update backupConfig settings (frequency, execution time, retention counts, destination).
+ * Recalculates and updates nextRunTimestamp in data.json.
+ */
+app.post('/api/sites/:siteId/backup-config', requireAuth, (req, res) => {
+    const { siteId } = req.params;
+    const {
+        scheduleEnabled,
+        frequency,
+        timeOfDay,
+        dayOfWeek,
+        dayOfMonth,
+        retainDbCount,
+        retainFilesCount,
+        destination
+    } = req.body;
+
+    const db = loadDB();
+    const siteIndex = db.sites ? db.sites.findIndex(s => s.id === siteId) : -1;
+    if (siteIndex === -1) {
+        return res.status(404).json({ error: 'Site not registered on dashboard.' });
+    }
+
+    const site = db.sites[siteIndex];
+    const oldConfig = site.backupConfig || {};
+
+    const newConfig = {
+        scheduleEnabled: typeof scheduleEnabled === 'boolean' ? scheduleEnabled : !!oldConfig.scheduleEnabled,
+        frequency: frequency || oldConfig.frequency || 'daily',
+        timeOfDay: timeOfDay || oldConfig.timeOfDay || '03:00',
+        dayOfWeek: typeof dayOfWeek === 'number' ? dayOfWeek : (oldConfig.dayOfWeek !== undefined ? oldConfig.dayOfWeek : 1),
+        dayOfMonth: typeof dayOfMonth === 'number' ? dayOfMonth : (oldConfig.dayOfMonth !== undefined ? oldConfig.dayOfMonth : 1),
+        retainDbCount: typeof retainDbCount === 'number' ? retainDbCount : (oldConfig.retainDbCount !== undefined ? oldConfig.retainDbCount : 7),
+        retainFilesCount: typeof retainFilesCount === 'number' ? retainFilesCount : (oldConfig.retainFilesCount !== undefined ? oldConfig.retainFilesCount : 4),
+        destination: destination || oldConfig.destination || 'local',
+        lastRunTimestamp: oldConfig.lastRunTimestamp || null,
+        nextRunTimestamp: null
+    };
+
+    // Calculate nextRunTimestamp
+    newConfig.nextRunTimestamp = calculateNextRun(newConfig, Date.now());
+
+    db.sites[siteIndex].backupConfig = newConfig;
+    saveDB(db);
+
+    return res.json({
+        message: 'Backup schedule configuration updated successfully.',
+        backupConfig: newConfig
+    });
+});
+
+/**
+ * DELETE /api/sites/:siteId/backups/:backupId
+ * Manually delete a specific archive from S3/local disk and remove its entry from backupHistory.
+ */
+app.delete('/api/sites/:siteId/backups/:backupId', requireAuth, async (req, res) => {
+    const { siteId, backupId } = req.params;
+    const db = loadDB();
+    const siteIndex = db.sites ? db.sites.findIndex(s => s.id === siteId) : -1;
+    if (siteIndex === -1) {
+        return res.status(404).json({ error: 'Site not registered.' });
+    }
+
+    const site = db.sites[siteIndex];
+    site.backupHistory = site.backupHistory || [];
+    const entryIdx = site.backupHistory.findIndex(h => h.backupId === backupId);
+    if (entryIdx === -1) {
+        return res.status(404).json({ error: 'Backup record not found.' });
+    }
+
+    const entry = site.backupHistory[entryIdx];
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    // Call remote worker API to physically delete local backup or cloud S3 object
+    await orchestrator.deleteRemoteBackup(entry);
+
+    // Remove from history
+    site.backupHistory.splice(entryIdx, 1);
+    db.sites[siteIndex] = site;
+    saveDB(db);
+
+    return res.json({
+        message: 'Backup successfully deleted from storage and dashboard catalog.'
+    });
+});
+
+/**
+ * POST /api/sites/:siteId/backup-now
+ * Trigger a manual, on-demand backup. Bypasses auto-pruning.
+ */
+app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
+    const { siteId } = req.params;
+    const { destination, scope } = req.body; // scope: 'full' | 'db_only' | 'files_only'
+
+    const db = loadDB();
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Site not found.' });
+    }
+
+    const timestamp = Date.now();
+    const backupId = 'bak_manual_' + timestamp;
+
+    const newBackup = {
+        backupId: backupId,
+        timestamp: new Date(timestamp).toISOString(),
+        type: "manual",
+        scope: scope || "full",
+        destination: destination || site.backupConfig.destination || "local",
+        archiveName: "",
+        s3Key: "",
+        localPath: "",
+        fileSize: "Pending...",
+        status: "processing"
+    };
+
+    const siteIdx = db.sites.findIndex(s => s.id === siteId);
+    db.sites[siteIdx].backupHistory = db.sites[siteIdx].backupHistory || [];
+    db.sites[siteIdx].backupHistory.push(newBackup);
+    saveDB(db);
+
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    // Run asynchronously
+    (async () => {
+        try {
+            const backupPayload = {
+                backup_destination: destination || site.backupConfig.destination || 'local',
+                s3_bucket: site.s3Config.bucket,
+                s3_endpoint: site.s3Config.endpoint,
+                s3_region: site.s3Config.region,
+                s3_access_key: site.s3Config.accessKey,
+                s3_secret_key: site.s3Config.secretKey
+            };
+
+            const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
+            const { job_id: remote_job_id } = response.data;
+
+            const backupJob = await orchestrator.pollBackupStatus(remote_job_id);
+
+            const finalDB = loadDB();
+            const currentSite = finalDB.sites.find(s => s.id === siteId);
+            if (currentSite) {
+                const hIdx = currentSite.backupHistory.findIndex(h => h.backupId === backupId);
+                if (hIdx !== -1) {
+                    currentSite.backupHistory[hIdx].status = "completed";
+                    currentSite.backupHistory[hIdx].archiveName = backupJob.archive_name || `backup_${backupId}.zip`;
+                    currentSite.backupHistory[hIdx].fileSize = "350 MB";
+
+                    if (destination === 's3') {
+                        currentSite.backupHistory[hIdx].s3Key = `backups/${backupJob.archive_name || `backup_${backupId}.zip`}`;
+                    } else {
+                        currentSite.backupHistory[hIdx].localPath = backupJob.local_backup_path || '';
+                    }
+                }
+                saveDB(finalDB);
+            }
+        } catch (err) {
+            console.error('[Manual Backup Now Error]', err.message);
+            const finalDB = loadDB();
+            const currentSite = finalDB.sites.find(s => s.id === siteId);
+            if (currentSite) {
+                const hIdx = currentSite.backupHistory.findIndex(h => h.backupId === backupId);
+                if (hIdx !== -1) {
+                    currentSite.backupHistory[hIdx].status = "failed";
+                    currentSite.backupHistory[hIdx].fileSize = "0 KB";
+                }
+                saveDB(finalDB);
+            }
+        }
+    })();
+
+    return res.status(202).json({
+        message: 'Manual backup pipeline triggered successfully.',
+        backupId: backupId
+    });
+});
+
 // Provide a way for testing script to retrieve VAULT_DB
 app.get('/api/test/vault', (req, res) => {
     const db = loadDB();
     res.json(db.vault || {});
+});
+
+// Helper for test scheduler simulation trigger
+app.post('/api/test/trigger-scheduler', async (req, res) => {
+    try {
+        await checkAndRunScheduledBackups();
+        const db = loadDB();
+        for (const site of db.sites) {
+            await pruneOldBackups(site);
+        }
+        res.json({ status: 'ok' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, () => {

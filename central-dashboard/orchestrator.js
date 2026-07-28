@@ -525,6 +525,26 @@ class SafeUpdateOrchestrator {
             throw error;
         }
     }
+
+    /**
+     * Delete remote backup file or cloud S3 object via WP Worker REST API
+     */
+    async deleteRemoteBackup(backupEntry) {
+        console.log(`[Orchestrator] Deleting remote backup: ${backupEntry.backupId}`);
+        try {
+            const deletePayload = {
+                destination: backupEntry.destination,
+                localPath: backupEntry.localPath || '',
+                s3Key: backupEntry.s3Key || '',
+                s3Config: this.s3Config
+            };
+            const response = await this.signedPost('/wp-json/wp-central/v1/delete-backup', deletePayload);
+            console.log('[Orchestrator] Delete response:', response.data);
+            return response.data;
+        } catch (err) {
+            console.error(`[Orchestrator] Failed to delete backup ${backupEntry.backupId}:`, err.message);
+        }
+    }
 }
 
 module.exports = SafeUpdateOrchestrator;

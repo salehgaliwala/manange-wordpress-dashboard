@@ -21,7 +21,39 @@
         "region": "us-east-1",
         "accessKey": "MOCK_S3_ACCESS_KEY",
         "secretKey": "MOCK_S3_SECRET_KEY"
-      }
+      },
+      "backupConfig": {
+        "scheduleEnabled": true,
+        "frequency": "daily",
+        "timeOfDay": "03:00",
+        "dayOfWeek": 1,
+        "dayOfMonth": 1,
+        "retainDbCount": 2,
+        "retainFilesCount": 2,
+        "destination": "local",
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": 1785294000000
+      },
+      "backupHistory": [
+        {
+          "backupId": "bak_manual_existing",
+          "timestamp": "2026-07-28T01:00:00Z",
+          "type": "manual",
+          "scope": "full",
+          "destination": "local",
+          "status": "completed",
+          "fileSize": "350 MB"
+        },
+        {
+          "backupId": "bak_sched_4",
+          "timestamp": "2026-07-28T05:00:00Z",
+          "type": "scheduled",
+          "scope": "full",
+          "destination": "local",
+          "status": "completed",
+          "fileSize": "350 MB"
+        }
+      ]
     }
   ],
   "vault": {
@@ -332,6 +364,25 @@
       "stepDescription": "⚠️ Pipeline broken: ",
       "resumable": true,
       "updatedAt": "2026-07-28T05:55:46.919Z"
+    },
+    "job_dashboard_1785266243049": {
+      "id": "job_dashboard_1785266243049",
+      "siteId": "example-wp-site",
+      "status": "processing",
+      "progress": 15,
+      "step": "Triggering target backup execution on target...",
+      "error": null,
+      "completed": false,
+      "backup_path": "",
+      "skip_backup": false,
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "akismet/akismet.php"
+        ],
+        "backup_destination": "local",
+        "skip_backup": false
+      }
     }
   }
 }
