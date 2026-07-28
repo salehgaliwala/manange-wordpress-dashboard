@@ -235,9 +235,14 @@ class SafeUpdateOrchestrator {
             }
         }
 
+        const skipBackup = !!updateParams.skip_backup;
+        if (skipBackup) {
+            console.log('[Orchestrator] Optional Skip Backup enabled. Bypassing remote backup.');
+        }
+
         try {
             // STEP 1: STEP_01_BACKUP_INITIATED
-            if (!lastCompletedStep) {
+            if (!lastCompletedStep && !skipBackup) {
                 this.checkJobCancelled(jobId);
                 console.log('\n--- Step 1: Triggering Remote Backup ---');
                 if (onStep) onStep(15, 'Triggering target backup execution on target...');
@@ -270,7 +275,7 @@ class SafeUpdateOrchestrator {
             }
 
             // STEP 2: STEP_02_BACKUP_COMPLETED
-            if (lastCompletedStep === 'STEP_01_BACKUP_INITIATED') {
+            if (lastCompletedStep === 'STEP_01_BACKUP_INITIATED' && !skipBackup) {
                 this.checkJobCancelled(jobId);
                 console.log('\n--- Step 2: Completing Remote Backup ---');
                 if (onStep) onStep(35, 'Polling target backup execution status...');
@@ -297,7 +302,7 @@ class SafeUpdateOrchestrator {
             }
 
             // STEP 3: STEP_03_PRE_SCREENSHOT
-            if (lastCompletedStep === 'STEP_02_BACKUP_COMPLETED') {
+            if (lastCompletedStep === 'STEP_02_BACKUP_COMPLETED' && !skipBackup) {
                 this.checkJobCancelled(jobId);
                 console.log('\n--- Step 3: Capturing Pre-Update visual state ---');
                 if (onStep) onStep(55, 'Capturing pre-update visual state via headless browser simulation...');
@@ -320,10 +325,10 @@ class SafeUpdateOrchestrator {
             }
 
             // STEP 4: STEP_04_UPDATES_APPLIED
-            if (lastCompletedStep === 'STEP_03_PRE_SCREENSHOT') {
+            if (lastCompletedStep === 'STEP_03_PRE_SCREENSHOT' || (skipBackup && !lastCompletedStep)) {
                 this.checkJobCancelled(jobId);
                 console.log('\n--- Step 4: Applying Core/Plugin Updates ---');
-                if (onStep) onStep(70, 'Applying Core/Plugin updates via WordPress upgrader routines...');
+                if (onStep) onStep(50, 'Applying Core/Plugin updates via WordPress upgrader routines...');
 
                 let finalUpdatePayload = { ...updateParams };
 
@@ -398,6 +403,25 @@ class SafeUpdateOrchestrator {
 
                 lastCompletedStep = 'STEP_04_UPDATES_APPLIED';
                 stepData.updateResult = updateResponse.data.message;
+
+                if (skipBackup) {
+                    this.saveJobState(jobId, {
+                        status: 'completed',
+                        lastCompletedStep: 'STEP_06_VISUAL_COMPARISON',
+                        stepData,
+                        progress: 100,
+                        step: 'STEP_06_VISUAL_COMPARISON',
+                        stepDescription: 'Updates applied successfully! Pipeline finished.',
+                        completed: true
+                    });
+                    if (onStep) onStep(100, '✓ Updates applied successfully! Pipeline finished.');
+
+                    return {
+                        success: true,
+                        message: stepData.updateResult || 'Safe Update Complete.',
+                        backup_path: 'Bypassed (Optional Skip Backup enabled)'
+                    };
+                }
 
                 this.saveJobState(jobId, {
                     status: 'processing',
