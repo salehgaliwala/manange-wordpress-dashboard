@@ -831,7 +831,7 @@ app.get('/api/sites/:siteId/updates-list', requireAuth, async (req, res) => {
  */
 app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const { siteId } = req.params;
-    const { type, plugins, backup_destination } = req.body;
+    const { type, plugins, backup_destination, skip_backup } = req.body;
 
     const db = loadDB();
     const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
@@ -857,7 +857,8 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         error: null,
         completed: false,
         backup_path: '',
-        updateParams: { type, plugins, backup_destination: destination }
+        skip_backup: !!skip_backup,
+        updateParams: { type, plugins, backup_destination: destination, skip_backup: !!skip_backup }
     };
     saveActiveJob(jobId, initialJobState);
 
@@ -865,7 +866,7 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
 
     // We execute the promise in the background without holding the HTTP response thread
     orchestrator.executeSafeUpdate(
-        { jobId, type, plugins, backup_destination: destination },
+        { jobId, type, plugins, backup_destination: destination, skip_backup: !!skip_backup },
         (progress, step) => {
             // Progress Callback: Update active jobs tracking map in real-time
             const currentDB = loadDB();
