@@ -145,6 +145,12 @@ class WPCentral_Worker_Controller {
             'callback'            => array($this, 'get_wp_status'),
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
+
+        register_rest_route('wp-central/v1', '/delete-backup', array(
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => array($this, 'handle_delete_backup'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
     }
 
     /**
@@ -639,6 +645,138 @@ public function get_wp_status(WP_REST_Request $request) {
         }
 
         return new WP_REST_Response($job_data, 200);
+    }
+
+    /**
+     * Handle deleting local backup zip files and S3 backup objects using the built-in AWS Signature V4 client.
+     * POST /wp-json/wp-central/v1/delete-backup
+     */
+    public function handle_delete_backup(WP_REST_Request $request) {
+        $params = $request->get_json_params();
+        $destination = isset($params['destination']) ? sanitize_text_field($params['destination']) : 'local';
+        $local_path = isset($params['localPath']) ? sanitize_text_field($params['localPath']) : '';
+        $s3_key = isset($params['s3Key']) ? sanitize_text_field($params['s3Key']) : '';
+        $s3_config = isset($params['s3Config']) ? $params['s3Config'] : array();
+
+        if ($destination === 'local') {
+            if (empty($local_path)) {
+                return new WP_Error('missing_path', __('Missing localPath parameter.', 'wp-central'), array('status' => 400));
+            }
+            // Sanity check to prevent directory traversal
+            $local_path = wp_normalize_path($local_path);
+            $local_vault = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
+            if (strpos($local_path, $local_vault) !== 0) {
+                return new WP_Error('invalid_path', __('Invalid local backup path.', 'wp-central'), array('status' => 400));
+            }
+
+            if (file_exists($local_path)) {
+                @unlink($local_path);
+                return new WP_REST_Response(array('status' => 'success', 'message' => 'Local backup zip file deleted successfully.'), 200);
+            } else {
+                return new WP_REST_Response(array('status' => 'success', 'message' => 'Local backup zip file was not found but cataloged as deleted.'), 200);
+            }
+        } elseif ($destination === 's3') {
+            if (empty($s3_key)) {
+                return new WP_Error('missing_s3_key', __('Missing s3Key parameter.', 'wp-central'), array('status' => 400));
+            }
+            if (empty($s3_config)) {
+                return new WP_Error('missing_s3_config', __('Missing s3Config parameter.', 'wp-central'), array('status' => 400));
+            }
+
+            try {
+                $this->delete_from_s3_compatible($s3_key, $s3_config);
+                return new WP_REST_Response(array('status' => 'success', 'message' => 'S3 backup object deleted successfully.'), 200);
+            } catch (Exception $e) {
+                return new WP_Error('s3_delete_error', $e->getMessage(), array('status' => 500));
+            }
+        }
+
+        return new WP_Error('invalid_destination', __('Invalid destination specified.', 'wp-central'), array('status' => 400));
+    }
+
+    /**
+     * Delete object from S3 using pure PHP Signature V4 AWS REST Client
+     */
+    private function delete_from_s3_compatible($s3_key, $s3_config) {
+        $bucket = $s3_config['bucket'];
+        $endpoint = rtrim($s3_config['endpoint'], '/');
+        $region = $s3_config['region'];
+        $access_key = $s3_config['access_key'];
+        $secret_key = $s3_config['secret_key'];
+
+        $host = parse_url($endpoint, PHP_URL_HOST);
+        $timestamp = gmdate('Ymd\THis\Z');
+        $date = substr($timestamp, 0, 8);
+
+        // Ensure key begins with single slash or bucket path
+        $object_name = ltrim($s3_key, '/');
+        $request_uri = '/' . $bucket . '/' . $object_name;
+        $request_url = $endpoint . '/' . $bucket . '/' . $object_name;
+
+        $payload_hash = hash('sha256', '');
+        $headers = array(
+            'host'                 => $host,
+            'x-amz-content-sha256' => $payload_hash,
+            'x-amz-date'           => $timestamp,
+        );
+
+        ksort($headers);
+        $canonical_headers = '';
+        foreach ($headers as $k => $v) {
+            $canonical_headers .= $k . ':' . trim($v) . "\n";
+        }
+
+        $signed_headers = implode(';', array_keys($headers));
+        $canonical_request = "DELETE\n" .
+                             $request_uri . "\n" .
+                             "" . "\n" .
+                             $canonical_headers . "\n" .
+                             $signed_headers . "\n" .
+                             $payload_hash;
+
+        $algorithm = 'AWS4-HMAC-SHA256';
+        $credential_scope = $date . '/' . $region . '/s3/aws4_request';
+        $string_to_sign = $algorithm . "\n" .
+                          $timestamp . "\n" .
+                          $credential_scope . "\n" .
+                          hash('sha256', $canonical_request);
+
+        $k_date = hash_hmac('sha256', $date, 'AWS4' . $secret_key, true);
+        $k_region = hash_hmac('sha256', $region, $k_date, true);
+        $k_service = hash_hmac('sha256', 's3', $k_region, true);
+        $k_signing = hash_hmac('sha256', 'aws4_request', $k_service, true);
+        $signature = hash_hmac('sha256', $string_to_sign, $k_signing);
+
+        $authorization = "$algorithm Credential=$access_key/$credential_scope, SignedHeaders=$signed_headers, Signature=$signature";
+
+        $args = array(
+            'method'    => 'DELETE',
+            'headers'   => array(
+                'Host'                 => $host,
+                'x-amz-content-sha256' => $payload_hash,
+                'x-amz-date'           => $timestamp,
+                'Authorization'        => $authorization
+            ),
+            'timeout'   => 60,
+            'sslverify' => false
+        );
+
+        $response = wp_remote_request($request_url, $args);
+
+        if (is_wp_error($response)) {
+            throw new Exception("S3 Delete Transmission Error: " . $response->get_error_message());
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        if ($status_code < 200 || $status_code >= 300) {
+            if ($status_code === 404) {
+                return true; // Already deleted or not found
+            }
+            $response_body = wp_remote_retrieve_body($response);
+            throw new Exception("S3 DELETE API rejection. Status: {$status_code}. Response: {$response_body}");
+        }
+
+        return true;
     }
 
     /**
