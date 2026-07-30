@@ -151,6 +151,18 @@ class WPCentral_Worker_Controller {
             'callback'            => array($this, 'handle_delete_backup'),
             'permission_callback' => array('WPCentral_Security', 'verify_request')
         ));
+
+        register_rest_route('wp-central/v1', '/restore', array(
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => array($this, 'handle_restore_initiation'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
+
+        register_rest_route('wp-central/v1', '/restore-process', array(
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => array($this, 'handle_background_restore_process'),
+            'permission_callback' => array('WPCentral_Security', 'verify_request')
+        ));
     }
 
     /**
@@ -330,6 +342,89 @@ public function get_wp_status(WP_REST_Request $request) {
     }
 
     /**
+     * Initiates non-blocking background restoration
+     * POST /wp-json/wp-central/v1/restore
+     */
+    public function handle_restore_initiation(WP_REST_Request $request) {
+        $params = $request->get_json_params();
+        $source = isset($params['source']) ? sanitize_text_field($params['source']) : 'local';
+        $full_path = isset($params['full_path']) ? sanitize_text_field($params['full_path']) : '';
+        $s3_key = isset($params['s3_key']) ? sanitize_text_field($params['s3_key']) : '';
+        $s3_config = isset($params['s3_config']) ? $params['s3_config'] : array();
+
+        if ($source === 's3' && empty($s3_key)) {
+            return new WP_Error('missing_s3_key', __('Missing s3_key parameter for cloud restore.', 'wp-central'), array('status' => 400));
+        }
+        if ($source === 'local' && empty($full_path)) {
+            return new WP_Error('missing_full_path', __('Missing full_path parameter for local restore.', 'wp-central'), array('status' => 400));
+        }
+
+        $job_id = 'job_restore_' . time() . '_' . wp_generate_password(8, false);
+
+        $job_data = array(
+            'status'             => 'pending',
+            'type'               => 'restore',
+            'source'             => $source,
+            'full_path'          => $full_path,
+            's3_key'             => $s3_key,
+            's3_config'          => $s3_config,
+            'progress'           => 0,
+            'created_at'         => time()
+        );
+        update_option('wp_central_job_' . $job_id, $job_data);
+
+        $body = json_encode(array('job_id' => $job_id));
+        $loopback_url = get_rest_url(null, '/wp-central/v1/restore-process');
+        $parsed = parse_url($loopback_url);
+        $host = isset($parsed['host']) ? $parsed['host'] : 'localhost';
+        $port = isset($parsed['port']) ? $parsed['port'] : (isset($_SERVER['SERVER_PORT']) ? $_SERVER['SERVER_PORT'] : '80');
+
+        $internal_url_a = 'http://127.0.0.1' . ($port ? ':' . $port : '') . (isset($parsed['path']) ? $parsed['path'] : '');
+        if (isset($parsed['query'])) {
+            $internal_url_a .= '?' . $parsed['query'];
+        }
+
+        $headers_a = WPCentral_Security::sign_request($body);
+        $headers_a['Content-Type'] = 'application/json';
+        $headers_a['Host'] = $host;
+
+        wp_remote_post($internal_url_a, array(
+            'blocking'  => false,
+            'sslverify' => false,
+            'timeout'   => 0.1,
+            'headers'   => $headers_a,
+            'body'      => $body
+        ));
+
+        $headers_b = WPCentral_Security::sign_request($body);
+        $headers_b['Content-Type'] = 'application/json';
+
+        wp_remote_post($loopback_url, array(
+            'blocking'  => false,
+            'sslverify' => false,
+            'timeout'   => 0.1,
+            'headers'   => $headers_b,
+            'body'      => $body
+        ));
+
+        return new WP_REST_Response(array(
+            'status' => 'accepted',
+            'job_id' => $job_id
+        ), 202);
+    }
+
+    /**
+     * Executes the background restoration process inline
+     * POST /wp-json/wp-central/v1/restore-process
+     */
+    public function handle_background_restore_process(WP_REST_Request $request) {
+        $params = $request->get_json_params();
+        $job_id = sanitize_text_field($params['job_id']);
+        $this->run_restore_process_inline($job_id);
+        return new WP_REST_Response(array('status' => 'finished'), 200);
+    }
+
+    /**
      * Check if a job has been paused or killed.
      * Throws an exception to abort/suspend execution gracefully.
      */
@@ -451,6 +546,373 @@ public function get_wp_status(WP_REST_Request $request) {
         } finally {
             restore_error_handler();
         }
+    }
+
+    /**
+     * Core background restoration engine
+     */
+    private function run_restore_process_inline($job_id) {
+        $job_data = get_option('wp_central_job_' . $job_id);
+        if (!$job_data || ($job_data['status'] !== 'pending' && $job_data['status'] !== 'processing')) {
+            return false;
+        }
+
+        @set_time_limit(0);
+        if (function_exists('session_write_close')) {
+            @session_write_close();
+        }
+        if (function_exists('ignore_user_abort')) {
+            ignore_user_abort(true);
+        }
+
+        set_error_handler(function($severity, $message, $file, $line) {
+            if (!(error_reporting() & $severity)) {
+                return;
+            }
+            throw new ErrorException($message, 0, $severity, $file, $line);
+        });
+
+        $job_data['status'] = 'processing';
+        $job_data['progress'] = 5;
+        update_option('wp_central_job_' . $job_id, $job_data);
+
+        $temp_dir = WP_CONTENT_DIR . '/uploads/wp-central-temp-restore-' . $job_id;
+        $maintenance_file = ABSPATH . '.maintenance';
+
+        try {
+            // Step 1: Enable Maintenance Mode
+            $job_data['progress'] = 10;
+            $job_data['step_message'] = 'Enabling WordPress maintenance mode...';
+            update_option('wp_central_job_' . $job_id, $job_data);
+
+            $maintenance_content = "<?php\n\$upgrading = " . time() . ";\n";
+            file_put_contents($maintenance_file, $maintenance_content);
+
+            if (!file_exists($temp_dir)) {
+                if (!mkdir($temp_dir, 0755, true)) {
+                    throw new Exception("Failed to create temporary restore folder at: " . $temp_dir);
+                }
+            }
+
+            // Step 2: Retrieve / Download Backup Archive
+            $source = isset($job_data['source']) ? $job_data['source'] : 'local';
+            $archive_file = $temp_dir . '/backup.zip';
+
+            if ($source === 's3') {
+                $job_data['progress'] = 20;
+                $job_data['step_message'] = 'Downloading backup archive from S3 cloud...';
+                update_option('wp_central_job_' . $job_id, $job_data);
+
+                $this->download_from_s3_compatible($job_data['s3_key'], $job_data['s3_config'], $archive_file);
+            } else {
+                $job_data['progress'] = 20;
+                $job_data['step_message'] = 'Locating local backup archive file...';
+                update_option('wp_central_job_' . $job_id, $job_data);
+
+                $local_path = $job_data['full_path'];
+                if (!file_exists($local_path)) {
+                    throw new Exception("Local backup file not found at: " . $local_path);
+                }
+                if (!copy($local_path, $archive_file)) {
+                    throw new Exception("Failed to copy local backup to temporary work directory.");
+                }
+            }
+
+            // Step 3: Extract ZIP Archive
+            $job_data['progress'] = 40;
+            $job_data['step_message'] = 'Extracting backup archive files...';
+            update_option('wp_central_job_' . $job_id, $job_data);
+
+            if (!class_exists('ZipArchive')) {
+                throw new Exception("ZipArchive PHP extension is not installed.");
+            }
+
+            $zip = new ZipArchive();
+            if ($zip->open($archive_file) !== true) {
+                throw new Exception("Failed to open backup ZIP archive.");
+            }
+
+            $extraction_path = $temp_dir . '/extracted';
+            if (!mkdir($extraction_path, 0755, true)) {
+                throw new Exception("Failed to create extracted temporary folder.");
+            }
+
+            $zip->extractTo($extraction_path);
+            $zip->close();
+
+            // Step 4: Overwrite /wp-content/ directories safely
+            $job_data['progress'] = 60;
+            $job_data['step_message'] = 'Restoring /wp-content/ files (plugins, themes, uploads)...';
+            update_option('wp_central_job_' . $job_id, $job_data);
+
+            $extracted_wp_content = $extraction_path . '/wp-content';
+            if (file_exists($extracted_wp_content)) {
+                // Recursively copy extracted files to WP_CONTENT_DIR, bypassing wp-worker-plugin folder
+                $this->recursive_restore_copy($extracted_wp_content, WP_CONTENT_DIR);
+            }
+
+            // Step 5: Restore Database
+            $job_data['progress'] = 80;
+            $job_data['step_message'] = 'Restoring database layout and table records...';
+            update_option('wp_central_job_' . $job_id, $job_data);
+
+            // Locate SQL dump file (look for database_dump.sql or db_backup.sql or *.sql)
+            $sql_file = '';
+            if (file_exists($extraction_path . '/database_dump.sql')) {
+                $sql_file = $extraction_path . '/database_dump.sql';
+            } elseif (file_exists($extraction_path . '/db_backup.sql')) {
+                $sql_file = $extraction_path . '/db_backup.sql';
+            } else {
+                $files = glob($extraction_path . '/*.sql');
+                if (!empty($files)) {
+                    $sql_file = $files[0];
+                }
+            }
+
+            if (!empty($sql_file) && file_exists($sql_file)) {
+                $this->import_database_tables($sql_file);
+            } else {
+                throw new Exception("No SQL database dump found in the backup ZIP archive.");
+            }
+
+            // Step 6: Final Clean-up and Cache Flush
+            $job_data['progress'] = 95;
+            $job_data['step_message'] = 'Finalizing restoration, clearing caches...';
+            update_option('wp_central_job_' . $job_id, $job_data);
+
+            if (file_exists($maintenance_file)) {
+                @unlink($maintenance_file);
+            }
+
+            $this->recursive_cleanup($temp_dir);
+
+            if (function_exists('wp_cache_flush')) {
+                wp_cache_flush();
+            }
+            if (function_exists('opcache_reset')) {
+                @opcache_reset();
+            }
+
+            $job_data['status'] = 'completed';
+            $job_data['progress'] = 100;
+            $job_data['step_message'] = '✓ Restoration complete! All files and tables successfully restored.';
+            $job_data['completed_at'] = time();
+            unset($job_data['s3_config']);
+            update_option('wp_central_job_' . $job_id, $job_data);
+            return true;
+
+        } catch (Throwable $e) {
+            if (file_exists($maintenance_file)) {
+                @unlink($maintenance_file);
+            }
+            $this->recursive_cleanup($temp_dir);
+
+            $formatted_error = sprintf(
+                "PHP Exception: %s inside file %s at line %d",
+                $e->getMessage(),
+                basename($e->getFile()),
+                $e->getLine()
+            );
+            $job_data['status'] = 'failed';
+            $job_data['error'] = $formatted_error;
+            $job_data['step_message'] = '⚠️ Restoration failed.';
+            unset($job_data['s3_config']);
+            update_option('wp_central_job_' . $job_id, $job_data);
+            return false;
+        } finally {
+            restore_error_handler();
+        }
+    }
+
+    /**
+     * Download object from S3 using pure PHP Signature V4 AWS REST Client
+     */
+    private function download_from_s3_compatible($s3_key, $s3_config, $target_filepath) {
+        $bucket = $s3_config['bucket'];
+        $endpoint = rtrim($s3_config['endpoint'], '/');
+        $region = $s3_config['region'];
+        $access_key = $s3_config['access_key'];
+        $secret_key = $s3_config['secret_key'];
+
+        $host = parse_url($endpoint, PHP_URL_HOST);
+        $timestamp = gmdate('Ymd\THis\Z');
+        $date = substr($timestamp, 0, 8);
+
+        $object_name = ltrim($s3_key, '/');
+        $request_uri = '/' . $bucket . '/' . $object_name;
+        $request_url = $endpoint . '/' . $bucket . '/' . $object_name;
+
+        $payload_hash = hash('sha256', '');
+        $headers = array(
+            'host'                 => $host,
+            'x-amz-content-sha256' => $payload_hash,
+            'x-amz-date'           => $timestamp,
+        );
+
+        ksort($headers);
+        $canonical_headers = '';
+        foreach ($headers as $k => $v) {
+            $canonical_headers .= $k . ':' . trim($v) . "\n";
+        }
+
+        $signed_headers = implode(';', array_keys($headers));
+        $canonical_request = "GET\n" .
+                             $request_uri . "\n" .
+                             "" . "\n" .
+                             $canonical_headers . "\n" .
+                             $signed_headers . "\n" .
+                             $payload_hash;
+
+        $algorithm = 'AWS4-HMAC-SHA256';
+        $credential_scope = $date . '/' . $region . '/s3/aws4_request';
+        $string_to_sign = $algorithm . "\n" .
+                          $timestamp . "\n" .
+                          $credential_scope . "\n" .
+                          hash('sha256', $canonical_request);
+
+        $k_date = hash_hmac('sha256', $date, 'AWS4' . $secret_key, true);
+        $k_region = hash_hmac('sha256', $region, $k_date, true);
+        $k_service = hash_hmac('sha256', 's3', $k_region, true);
+        $k_signing = hash_hmac('sha256', 'aws4_request', $k_service, true);
+        $signature = hash_hmac('sha256', $string_to_sign, $k_signing);
+
+        $authorization = "$algorithm Credential=$access_key/$credential_scope, SignedHeaders=$signed_headers, Signature=$signature";
+
+        $args = array(
+            'method'    => 'GET',
+            'headers'   => array(
+                'Host'                 => $host,
+                'x-amz-content-sha256' => $payload_hash,
+                'x-amz-date'           => $timestamp,
+                'Authorization'        => $authorization
+            ),
+            'timeout'   => 300,
+            'sslverify' => false
+        );
+
+        $response = wp_remote_request($request_url, $args);
+
+        if (is_wp_error($response)) {
+            throw new Exception("S3 Download Transmission Error: " . $response->get_error_message());
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        if ($status_code < 200 || $status_code >= 300) {
+            $response_body = wp_remote_retrieve_body($response);
+            throw new Exception("S3 GET API rejection. Status: {$status_code}. Response: {$response_body}");
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        if (empty($body)) {
+            throw new Exception("S3 Download returned an empty archive body.");
+        }
+
+        if (file_put_contents($target_filepath, $body) === false) {
+            throw new Exception("Failed to write downloaded archive to disk.");
+        }
+    }
+
+    /**
+     * Recursively copy files/folders to destination, skipping worker plugin itself
+     */
+    private function recursive_restore_copy($src, $dst) {
+        $dir = opendir($src);
+        if (!$dir) return;
+
+        if (!file_exists($dst)) {
+            mkdir($dst, 0755, true);
+        }
+
+        while (($file = readdir($dir)) !== false) {
+            if ($file === '.' || $file === '..') {
+                continue;
+            }
+
+            $src_file = $src . '/' . $file;
+            $dst_file = $dst . '/' . $file;
+
+            // Strict gate: skip overwriting the wp-worker-plugin folder
+            if (strpos(wp_normalize_path($dst_file), wp_normalize_path(WP_CONTENT_DIR . '/plugins/wp-worker-plugin')) === 0) {
+                continue;
+            }
+
+            if (is_dir($src_file)) {
+                $this->recursive_restore_copy($src_file, $dst_file);
+            } else {
+                copy($src_file, $dst_file);
+            }
+        }
+        closedir($dir);
+    }
+
+    /**
+     * Database tables and queries importer with CLI fast-path & PHP parser fallback
+     */
+    private function import_database_tables($sql_file) {
+        global $wpdb;
+
+        // Fast Path: Check if native CLI execution is allowed/enabled, and mysql client exists
+        if ($this->is_exec_enabled()) {
+            exec('which mysql', $out, $code);
+            if ($code === 0) {
+                $host_parts = explode(':', DB_HOST);
+                $db_host = $host_parts[0];
+                $db_port = isset($host_parts[1]) ? $host_parts[1] : '';
+
+                $cmd = 'mysql';
+                if (!empty($db_host)) {
+                    $cmd .= ' -h ' . escapeshellarg($db_host);
+                }
+                if (!empty($db_port) && is_numeric($db_port)) {
+                    $cmd .= ' -P ' . escapeshellarg($db_port);
+                }
+                $cmd .= ' -u ' . escapeshellarg(DB_USER);
+                if (defined('DB_PASSWORD') && !empty(DB_PASSWORD)) {
+                    $cmd .= ' -p' . escapeshellarg(DB_PASSWORD);
+                }
+                $cmd .= ' ' . escapeshellarg(DB_NAME);
+
+                // Disable constraint checks inside mysql directly or in command prepends
+                $cmd = '(echo "SET FOREIGN_KEY_CHECKS = 0; SET UNIQUE_CHECKS = 0;"; cat ' . escapeshellarg($sql_file) . ') | ' . $cmd;
+
+                exec($cmd, $output, $return_var);
+                if ($return_var === 0) {
+                    return true; // Fast path import successful!
+                }
+            }
+        }
+
+        // Pure PHP fallback parser
+        $wpdb->save_queries = false;
+        $wpdb->suppress_errors(true);
+
+        $wpdb->query("SET FOREIGN_KEY_CHECKS = 0;");
+        $wpdb->query("SET UNIQUE_CHECKS = 0;");
+
+        $lines = file($sql_file);
+        if ($lines === false) {
+            throw new Exception("Failed to read database dump file.");
+        }
+
+        $query = '';
+        foreach ($lines as $line) {
+            // Skip comments and empty lines
+            if (empty($line) || strpos(trim($line), '--') === 0 || strpos(trim($line), '/*') === 0 || strpos(trim($line), '#') === 0) {
+                continue;
+            }
+
+            $query .= $line;
+
+            // If line ends with a semicolon, execute it
+            if (substr(trim($line), -1) === ';') {
+                $wpdb->query($query);
+                $query = '';
+            }
+        }
+
+        $wpdb->query("SET FOREIGN_KEY_CHECKS = 1;");
+        $wpdb->query("SET UNIQUE_CHECKS = 1;");
+        return true;
     }
 
     /**
@@ -643,7 +1105,11 @@ public function get_wp_status(WP_REST_Request $request) {
         }
 
         if ($job_data['status'] === 'pending' && (time() - intval($job_data['created_at'])) > 5) {
-            $this->run_backup_process_inline($job_id);
+            if (isset($job_data['type']) && $job_data['type'] === 'restore') {
+                $this->run_restore_process_inline($job_id);
+            } else {
+                $this->run_backup_process_inline($job_id);
+            }
             $job_data = get_option('wp_central_job_' . $job_id);
         }
 

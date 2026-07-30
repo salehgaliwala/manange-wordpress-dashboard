@@ -149,6 +149,13 @@
             // Optional automated backups before updates (default: true)
             const [takeBackup, setTakeBackup] = useState(true);
 
+            // Active job type ('update' or 'restore')
+            const [jobType, setJobType] = useState('update');
+
+            // Restoration state variables
+            const [restoringBackup, setRestoringBackup] = useState(null);
+            const [confirmSiteText, setConfirmSiteText] = useState('');
+
             // Polling interval ref
             const pollerRef = useRef(null);
 
@@ -518,6 +525,7 @@
                             const job = await res.json();
                             setJobProgress(job.progress);
                             setJobStep(job.step);
+                            setJobType(job.type || 'update');
 
                             if (job.status === 'completed') {
                                 clearInterval(pollerRef.current);
@@ -574,6 +582,49 @@
                     }
                 } catch (err) {
                     alert('Network error executing update pipeline.');
+                    setActiveJobId(null);
+                }
+            };
+
+            const handleInitiateRestore = (backup) => {
+                setRestoringBackup(backup);
+                setConfirmSiteText('');
+            };
+
+            const handleExecuteRestore = async () => {
+                if (!viewingSite || !restoringBackup) return;
+
+                const backup = restoringBackup;
+                setRestoringBackup(null);
+                setViewingSite(null); // Close the slide-out drawer
+                setActiveJobId('initializing...');
+                setJobProgress(10);
+                setJobStep('Initializing restoration pipeline...');
+                setJobType('restore');
+
+                try {
+                    const res = await fetch(`/api/sites/${viewingSite.id}/restore`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            backupId: backup.backupId,
+                            source: backup.destination,
+                            fullPath: backup.localPath || '',
+                            s3Key: backup.s3Key || ''
+                        })
+                    });
+
+                    if (res.status === 202) {
+                        const data = await res.json();
+                        setActiveJobId(data.job_id);
+                        startPollingJob(data.job_id);
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to start restoration pipeline.');
+                        setActiveJobId(null);
+                    }
+                } catch (err) {
+                    alert('Network error executing restoration pipeline.');
                     setActiveJobId(null);
                 }
             };
@@ -759,7 +810,11 @@
                                                     <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
                                                 </span>
                                             ) : null}
-                                            {jobFailed ? '⚠️ Automated Update Pipeline Failed' : 'Automated Update Pipeline Progress'}
+                                            {jobFailed ? (
+                                                jobType === 'restore' ? '⚠️ Site Restoration Failed' : '⚠️ Automated Update Pipeline Failed'
+                                            ) : (
+                                                jobType === 'restore' ? '🔄 Site Restoration Progress' : 'Automated Update Pipeline Progress'
+                                            )}
                                         </h3>
                                         <p className="text-xs text-slate-400 font-mono mt-0.5">Job ID: {activeJobId}</p>
                                     </div>
@@ -791,16 +846,35 @@
 
                                 {jobProgress >= 100 && !jobFailed && (
                                     <div className="pt-4 border-t border-slate-800">
-                                        <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
-                                            <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
-                                            <p className="text-xs text-slate-300">
-                                                WordPress core and plugin packages have been safely updated directly on the worker. The previous system files and database were archived and secure.
-                                            </p>
-                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
-                                                <span className="text-slate-500 font-semibold">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump (Skip non-readable files: Enabled)<br/>
-                                                <span className="text-slate-500 font-semibold">Backup Storage Destination:</span> {finalBackupPath}
+                                        {jobType === 'restore' ? (
+                                            <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-3">
+                                                <span className="text-emerald-400 font-bold block text-sm">✓ Restoration Successful</span>
+                                                <p className="text-xs text-slate-300">
+                                                    WordPress database tables and files have been successfully restored to the target site. Local maintenance lock has been cleared.
+                                                </p>
+                                                <div className="pt-2">
+                                                    <a
+                                                        href="http://localhost:8080/"
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2.5 rounded-lg transition"
+                                                    >
+                                                        Verify Restored Site Live ↗
+                                                    </a>
+                                                </div>
                                             </div>
-                                        </div>
+                                        ) : (
+                                            <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
+                                                <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
+                                                <p className="text-xs text-slate-300">
+                                                    WordPress core and plugin packages have been safely updated directly on the worker. The previous system files and database were archived and secure.
+                                                </p>
+                                                <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
+                                                    <span className="text-slate-500 font-semibold">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump (Skip non-readable files: Enabled)<br/>
+                                                    <span className="text-slate-500 font-semibold">Backup Storage Destination:</span> {finalBackupPath}
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -1435,6 +1509,13 @@
                                                                                     <>
                                                                                         <button
                                                                                             type="button"
+                                                                                            onClick={() => handleInitiateRestore(backup)}
+                                                                                            className="text-amber-500 hover:text-amber-400 font-bold mr-2.5"
+                                                                                        >
+                                                                                            Restore Site
+                                                                                        </button>
+                                                                                        <button
+                                                                                            type="button"
                                                                                             onClick={() => {
                                                                                                 if (backup.localPath) {
                                                                                                     alert(`Download Path: ${backup.localPath}`);
@@ -1451,7 +1532,7 @@
                                                                                         <button
                                                                                             type="button"
                                                                                             onClick={() => handleDeleteBackupEntry(backup.backupId)}
-                                                                                            className="text-rose-400 hover:text-rose-300 font-bold ml-1"
+                                                                                            className="text-rose-400 hover:text-rose-300 font-bold ml-2.5"
                                                                                         >
                                                                                             Delete
                                                                                         </button>
@@ -1468,6 +1549,63 @@
                                             </div>
                                         </div>
                                     )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Confirmation Safety Modal for Site Restoration */}
+                    {restoringBackup && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-[60] animate-fadeIn">
+                            <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl w-full max-w-lg space-y-5 shadow-2xl">
+                                <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                                    <h3 className="text-lg font-black text-amber-500 flex items-center gap-2">
+                                        <span>⚠️ High-Priority Safety Confirmation</span>
+                                    </h3>
+                                    <button
+                                        onClick={() => setRestoringBackup(null)}
+                                        className="text-slate-400 hover:text-slate-100 font-bold text-lg"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                <div className="p-4 rounded-xl bg-amber-950/20 border border-amber-900/50 space-y-3">
+                                    <p className="text-xs text-amber-200 font-semibold leading-relaxed">
+                                        ⚠️ <strong className="text-amber-400">CRITICAL WARNING</strong>: Restoring <strong className="underline text-slate-100">{viewingSite?.name}</strong> will overwrite all existing database tables and <code className="bg-slate-950 px-1 py-0.5 rounded">/wp-content/</code> files with the data from <strong className="text-slate-100">{restoringBackup.timestamp ? new Date(restoringBackup.timestamp).toUTCString() : 'the backup archive'}</strong>. This action cannot be undone.
+                                    </p>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-xs font-bold text-slate-400 block">
+                                        Type the site name to confirm: <span className="font-mono text-slate-200 select-all font-black">{viewingSite?.name}</span>
+                                    </label>
+                                    <input
+                                        type="text"
+                                        required
+                                        value={confirmSiteText}
+                                        onChange={(e) => setConfirmSiteText(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono"
+                                        placeholder="Type site name exactly..."
+                                    />
+                                </div>
+
+                                <div className="flex gap-3 justify-end pt-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setRestoringBackup(null)}
+                                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-4 py-2.5 rounded-lg font-bold"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleExecuteRestore}
+                                        disabled={confirmSiteText.trim().toLowerCase() !== viewingSite?.name.toLowerCase()}
+                                        className="bg-amber-600 hover:bg-amber-700 text-white text-xs px-5 py-2.5 rounded-lg font-bold transition disabled:opacity-40"
+                                    >
+                                        I understand, proceed with restoration
+                                    </button>
                                 </div>
                             </div>
                         </div>

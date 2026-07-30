@@ -1525,6 +1525,76 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
     });
 });
 
+/**
+ * POST /api/sites/:siteId/restore
+ * Triggers a full-stack asynchronous restoration job.
+ * Protected by requireAuth
+ */
+app.post('/api/sites/:siteId/restore', requireAuth, async (req, res) => {
+    const { siteId } = req.params;
+    const { backupId, source, fullPath, s3Key } = req.body;
+
+    const db = loadDB();
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Site not found.' });
+    }
+
+    const jobId = 'job_restore_' + Date.now();
+
+    const initialRestoreJobState = {
+        id: jobId,
+        siteId: siteId,
+        status: 'processing',
+        progress: 5,
+        step: 'Initializing restoration pipeline connection...',
+        error: null,
+        completed: false,
+        type: 'restore',
+        restoreParams: { backupId, source, fullPath, s3Key }
+    };
+
+    saveActiveJob(jobId, initialRestoreJobState);
+
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    // Launch restoration pipeline asynchronously
+    orchestrator.executeSiteRestore(
+        { jobId, source, fullPath, s3Key },
+        (progress, step) => {
+            const currentDB = loadDB();
+            if (currentDB.jobs && currentDB.jobs[jobId]) {
+                currentDB.jobs[jobId].progress = progress;
+                currentDB.jobs[jobId].step = step;
+                saveDB(currentDB);
+            }
+        }
+    ).then(result => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'completed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = '✓ Restoration complete! All database tables and files restored successfully.';
+            currentDB.jobs[jobId].completed = true;
+            saveDB(currentDB);
+        }
+    }).catch(err => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'failed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = `⚠️ Restoration failed: ${err.message}`;
+            currentDB.jobs[jobId].error = err.message;
+            saveDB(currentDB);
+        }
+    });
+
+    return res.status(202).json({
+        status: 'accepted',
+        job_id: jobId
+    });
+});
+
 // Provide a way for testing script to retrieve VAULT_DB
 app.get('/api/test/vault', (req, res) => {
     const db = loadDB();

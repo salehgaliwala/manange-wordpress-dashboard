@@ -37,22 +37,14 @@
       },
       "backupHistory": [
         {
-          "backupId": "bak_manual_existing",
-          "timestamp": "2026-07-28T01:00:00Z",
+          "backupId": "bak_manual_restore_test_123",
+          "timestamp": "2026-07-30T19:47:56.992Z",
           "type": "manual",
           "scope": "full",
           "destination": "local",
           "status": "completed",
-          "fileSize": "350 MB"
-        },
-        {
-          "backupId": "bak_sched_4",
-          "timestamp": "2026-07-28T05:00:00Z",
-          "type": "scheduled",
-          "scope": "full",
-          "destination": "local",
-          "status": "completed",
-          "fileSize": "350 MB"
+          "fileSize": "1 KB",
+          "localPath": "/app/central-dashboard/temp_uploads/wp-central-backups-test/test_branded_backup.zip"
         }
       ]
     }
@@ -383,6 +375,22 @@
         ],
         "backup_destination": "local",
         "skip_backup": false
+      }
+    },
+    "job_restore_1785440876998": {
+      "id": "job_restore_1785440876998",
+      "siteId": "example-wp-site",
+      "status": "failed",
+      "progress": 100,
+      "step": "⚠️ Restoration failed: ",
+      "error": "",
+      "completed": false,
+      "type": "restore",
+      "restoreParams": {
+        "backupId": "bak_manual_restore_test_123",
+        "source": "local",
+        "fullPath": "/app/central-dashboard/temp_uploads/wp-central-backups-test/test_branded_backup.zip",
+        "s3Key": ""
       }
     }
   }
