@@ -31,8 +31,9 @@
         "retainDbCount": 2,
         "retainFilesCount": 2,
         "destination": "local",
+        "localBackupPath": "/var/backups/custom-isolated-wp-central/",
         "lastRunTimestamp": null,
-        "nextRunTimestamp": 1785294000000
+        "nextRunTimestamp": 1785466800000
       },
       "backupHistory": [
         {

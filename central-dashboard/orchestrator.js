@@ -247,13 +247,18 @@ class SafeUpdateOrchestrator {
                 console.log('\n--- Step 1: Triggering Remote Backup ---');
                 if (onStep) onStep(15, 'Triggering target backup execution on target...');
 
+                const custom_path = updateParams.local_backup_path || '';
+                const archive_name = updateParams.archive_name || this.generateBackupFilename(updateParams.siteName || 'site', 'update', jobId);
+
                 const backupPayload = {
                     backup_destination: updateParams.backup_destination || 's3',
                     s3_bucket: this.s3Config.bucket,
                     s3_endpoint: this.s3Config.endpoint,
                     s3_region: this.s3Config.region,
                     s3_access_key: this.s3Config.accessKey,
-                    s3_secret_key: this.s3Config.secretKey
+                    s3_secret_key: this.s3Config.secretKey,
+                    local_backup_path: custom_path,
+                    archive_name: archive_name
                 };
 
                 const backupInitResponse = await this.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
@@ -527,16 +532,45 @@ class SafeUpdateOrchestrator {
     }
 
     /**
+     * Helper to sanitize site name for file-safe branded naming.
+     */
+    sanitizeSiteName(name) {
+        if (!name) return 'site';
+        return name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/__+/g, '_');
+    }
+
+    /**
+     * Generates standard formatted branded ZIP archive filename:
+     * {Sanitized_Site_Name}_backup_{YYYY-MM-DD_HHmmss}_{JobType}_{ShortJobId}.zip
+     */
+    generateBackupFilename(siteName, jobType, jobId) {
+        const sanitized = this.sanitizeSiteName(siteName);
+        const now = new Date();
+        const yyyy = now.getUTCFullYear();
+        const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(now.getUTCDate()).padStart(2, '0');
+        const hh = String(now.getUTCHours()).padStart(2, '0');
+        const min = String(now.getUTCMinutes()).padStart(2, '0');
+        const ss = String(now.getUTCSeconds()).padStart(2, '0');
+
+        const timestampStr = `${yyyy}-${mm}-${dd}_${hh}${min}${ss}`;
+        const shortId = jobId ? jobId.split('_').pop().substring(0, 4) : Math.random().toString(36).substring(2, 6);
+
+        return `${sanitized}_backup_${timestampStr}_${jobType}_${shortId}.zip`;
+    }
+
+    /**
      * Delete remote backup file or cloud S3 object via WP Worker REST API
      */
-    async deleteRemoteBackup(backupEntry) {
+    async deleteRemoteBackup(backupEntry, customLocalVault = '') {
         console.log(`[Orchestrator] Deleting remote backup: ${backupEntry.backupId}`);
         try {
             const deletePayload = {
                 destination: backupEntry.destination,
                 localPath: backupEntry.localPath || '',
                 s3Key: backupEntry.s3Key || '',
-                s3Config: this.s3Config
+                s3Config: this.s3Config,
+                customLocalVault: customLocalVault || ''
             };
             const response = await this.signedPost('/wp-json/wp-central/v1/delete-backup', deletePayload);
             console.log('[Orchestrator] Delete response:', response.data);
