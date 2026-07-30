@@ -268,7 +268,9 @@ public function get_wp_status(WP_REST_Request $request) {
             'backup_destination' => $destination,
             'progress'           => 0,
             'created_at'         => time(),
-            's3_config'          => $s3_config
+            's3_config'          => $s3_config,
+            'local_backup_path'  => isset($params['local_backup_path']) ? sanitize_text_field($params['local_backup_path']) : '',
+            'archive_name'       => isset($params['archive_name']) ? sanitize_text_field($params['archive_name']) : ''
         );
         update_option('wp_central_job_' . $job_id, $job_data);
 
@@ -390,7 +392,8 @@ public function get_wp_status(WP_REST_Request $request) {
             $this->check_job_cancelled($job_id);
 
             // Step 2: Zip /wp-content/ directory
-            $this->zip_wp_content($zip_filepath, $sql_filepath, $temp_dir);
+            $custom_local_vault = !empty($job_data['local_backup_path']) ? $job_data['local_backup_path'] : '';
+            $this->zip_wp_content($zip_filepath, $sql_filepath, $temp_dir, $custom_local_vault);
             $job_data['progress'] = 70;
             update_option('wp_central_job_' . $job_id, $job_data);
 
@@ -402,15 +405,15 @@ public function get_wp_status(WP_REST_Request $request) {
                 $this->recursive_cleanup($temp_dir);
                 $final_path = 'S3 Cloud Storage Bucket: ' . $job_data['s3_config']['bucket'];
             } else {
-                // Local Vault destination
-                $local_vault = WP_CONTENT_DIR . '/uploads/wp-central-backups';
+                // Local Vault destination - support custom isolated path
+                $local_vault = !empty($job_data['local_backup_path']) ? $job_data['local_backup_path'] : WP_CONTENT_DIR . '/uploads/wp-central-backups';
                 if (!file_exists($local_vault)) {
                     if (!mkdir($local_vault, 0755, true)) {
                         throw new Exception("Failed to create local backups directory: " . $local_vault);
                     }
                 }
-                $local_archive_name = 'backup_' . $job_id . '.zip';
-                $final_archive_path = $local_vault . '/' . $local_archive_name;
+                $local_archive_name = !empty($job_data['archive_name']) ? $job_data['archive_name'] : 'backup_' . $job_id . '.zip';
+                $final_archive_path = rtrim($local_vault, '/\\') . '/' . $local_archive_name;
 
                 if (!rename($zip_filepath, $final_archive_path)) {
                     throw new Exception("Failed to save zip to local backups folder.");
@@ -657,6 +660,7 @@ public function get_wp_status(WP_REST_Request $request) {
         $local_path = isset($params['localPath']) ? sanitize_text_field($params['localPath']) : '';
         $s3_key = isset($params['s3Key']) ? sanitize_text_field($params['s3Key']) : '';
         $s3_config = isset($params['s3Config']) ? $params['s3Config'] : array();
+        $custom_local_vault = isset($params['customLocalVault']) ? sanitize_text_field($params['customLocalVault']) : '';
 
         if ($destination === 'local') {
             if (empty($local_path)) {
@@ -665,7 +669,15 @@ public function get_wp_status(WP_REST_Request $request) {
             // Sanity check to prevent directory traversal
             $local_path = wp_normalize_path($local_path);
             $local_vault = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
-            if (strpos($local_path, $local_vault) !== 0) {
+            $custom_vault_normalized = !empty($custom_local_vault) ? wp_normalize_path($custom_local_vault) : '';
+
+            $is_allowed = (strpos($local_path, $local_vault) === 0);
+            if (!$is_allowed && !empty($custom_vault_normalized)) {
+                $is_allowed = (strpos($local_path, $custom_vault_normalized) === 0);
+            }
+
+            // Also check for directory traversal via '..'
+            if (!$is_allowed || strpos($local_path, '..') !== false) {
                 return new WP_Error('invalid_path', __('Invalid local backup path.', 'wp-central'), array('status' => 400));
             }
 
@@ -936,7 +948,7 @@ public function get_wp_status(WP_REST_Request $request) {
     /**
      * Zip recursive worker excluding workspace directory
      */
-    private function zip_wp_content($zip_filepath, $sql_filepath, $exclude_dir) {
+    private function zip_wp_content($zip_filepath, $sql_filepath, $exclude_dir, $custom_local_vault = '') {
         // Fast Path: Check if native CLI zip is allowed/enabled and run it
         if ($this->is_exec_enabled()) {
             exec('which zip', $out, $code);
@@ -972,6 +984,7 @@ public function get_wp_status(WP_REST_Request $request) {
         $norm_exclude_dir = wp_normalize_path($exclude_dir);
         $norm_backups_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads/wp-central-backups');
         $norm_uploads_dir = wp_normalize_path(WP_CONTENT_DIR . '/uploads');
+        $norm_custom_vault = !empty($custom_local_vault) ? wp_normalize_path($custom_local_vault) : '';
 
         $files = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($wp_content_dir, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -982,8 +995,13 @@ public function get_wp_status(WP_REST_Request $request) {
             if (!$file->isDir()) {
                 $real_path = wp_normalize_path($file->getRealPath());
 
-                // Skip current temp directory, local backup vault, and the heavy uploads folder
-                if ($real_path && (strpos($real_path, $norm_exclude_dir) === 0 || strpos($real_path, $norm_backups_dir) === 0 || strpos($real_path, $norm_uploads_dir) === 0)) {
+                // Skip current temp directory, local backup vault, custom backup vault, and the heavy uploads folder
+                if ($real_path && (
+                    strpos($real_path, $norm_exclude_dir) === 0 ||
+                    strpos($real_path, $norm_backups_dir) === 0 ||
+                    strpos($real_path, $norm_uploads_dir) === 0 ||
+                    (!empty($norm_custom_vault) && strpos($real_path, $norm_custom_vault) === 0)
+                )) {
                     continue;
                 }
 

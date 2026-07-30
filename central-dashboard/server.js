@@ -65,9 +65,13 @@ function loadDB() {
                                 retainDbCount: 7,
                                 retainFilesCount: 4,
                                 destination: "local",
+                                localBackupPath: "",
                                 nextRunTimestamp: null,
                                 lastRunTimestamp: null
                             };
+                            changed = true;
+                        } else if (site.backupConfig.localBackupPath === undefined) {
+                            site.backupConfig.localBackupPath = "";
                             changed = true;
                         }
                         if (!site.backupHistory) {
@@ -152,9 +156,12 @@ function loadDB() {
                             retainDbCount: 7,
                             retainFilesCount: 4,
                             destination: "local",
+                                localBackupPath: "",
                             nextRunTimestamp: null,
                             lastRunTimestamp: null
                         };
+                        } else if (site.backupConfig.localBackupPath === undefined) {
+                            site.backupConfig.localBackupPath = "";
                     }
                     if (!site.backupHistory) {
                         site.backupHistory = [];
@@ -396,6 +403,7 @@ app.post('/api/sites', requireAuth, (req, res) => {
             retainDbCount: 7,
             retainFilesCount: 4,
             destination: "local",
+            localBackupPath: "",
             nextRunTimestamp: null,
             lastRunTimestamp: null
         },
@@ -924,6 +932,10 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     // Generate unique Job ID on the dashboard
     const jobId = 'job_dashboard_' + Date.now();
     const destination = backup_destination || 's3';
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    const customLocalPath = (destination === 'local' && site.backupConfig) ? site.backupConfig.localBackupPath : '';
+    const brandedArchiveName = orchestrator.generateBackupFilename(site.name, 'update', jobId);
 
     // Initialize job state in tracking map
     const initialJobState = {
@@ -936,15 +948,21 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         completed: false,
         backup_path: '',
         skip_backup: !!skip_backup,
-        updateParams: { type, plugins, backup_destination: destination, skip_backup: !!skip_backup }
+        updateParams: {
+            type,
+            plugins,
+            backup_destination: destination,
+            skip_backup: !!skip_backup,
+            siteName: site.name,
+            local_backup_path: customLocalPath,
+            archive_name: brandedArchiveName
+        }
     };
     saveActiveJob(jobId, initialJobState);
 
-    const orchestrator = new SafeUpdateOrchestrator(site);
-
     // We execute the promise in the background without holding the HTTP response thread
     orchestrator.executeSafeUpdate(
-        { jobId, type, plugins, backup_destination: destination, skip_backup: !!skip_backup },
+        initialJobState.updateParams,
         (progress, step) => {
             // Progress Callback: Update active jobs tracking map in real-time
             const currentDB = loadDB();
@@ -1154,6 +1172,10 @@ async function runScheduledBackup(site, timestamp) {
 
     console.log(`[Scheduler] Dispatching background backup job ${backupId} for site: ${site.name}`);
 
+    const destination = site.backupConfig.destination || "local";
+    const customLocalPath = (destination === 'local') ? (site.backupConfig.localBackupPath || '') : '';
+    const brandedArchiveName = orchestrator.generateBackupFilename(site.name, 'scheduled', backupId);
+
     // Log the initial record in history
     const db = loadDB();
     const siteIdx = db.sites.findIndex(s => s.id === site.id);
@@ -1164,8 +1186,8 @@ async function runScheduledBackup(site, timestamp) {
         timestamp: new Date(timestamp).toISOString(),
         type: "scheduled",
         scope: "full",
-        destination: site.backupConfig.destination || "local",
-        archiveName: "",
+        destination: destination,
+        archiveName: brandedArchiveName,
         s3Key: "",
         localPath: "",
         fileSize: "Pending...",
@@ -1178,12 +1200,14 @@ async function runScheduledBackup(site, timestamp) {
 
     try {
         const backupPayload = {
-            backup_destination: site.backupConfig.destination || 'local',
+            backup_destination: destination,
             s3_bucket: site.s3Config.bucket,
             s3_endpoint: site.s3Config.endpoint,
             s3_region: site.s3Config.region,
             s3_access_key: site.s3Config.accessKey,
-            s3_secret_key: site.s3Config.secretKey
+            s3_secret_key: site.s3Config.secretKey,
+            local_backup_path: customLocalPath,
+            archive_name: brandedArchiveName
         };
 
         const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
@@ -1269,11 +1293,12 @@ async function pruneOldBackups(site) {
     if (toPruneIds.size > 0) {
         console.log(`[Pruner] Pruning ${toPruneIds.size} old scheduled backups for site: ${currentSite.name}`);
         const orchestrator = new SafeUpdateOrchestrator(currentSite);
+        const custom_path = config.localBackupPath || '';
 
         for (const bId of toPruneIds) {
             const entry = history.find(h => h.backupId === bId);
             if (entry) {
-                await orchestrator.deleteRemoteBackup(entry);
+                await orchestrator.deleteRemoteBackup(entry, custom_path);
                 history = history.filter(h => h.backupId !== bId);
             }
         }
@@ -1334,6 +1359,7 @@ app.post('/api/sites/:siteId/backup-config', requireAuth, (req, res) => {
         return res.status(404).json({ error: 'Site not registered on dashboard.' });
     }
 
+    const { localBackupPath } = req.body;
     const site = db.sites[siteIndex];
     const oldConfig = site.backupConfig || {};
 
@@ -1346,6 +1372,7 @@ app.post('/api/sites/:siteId/backup-config', requireAuth, (req, res) => {
         retainDbCount: typeof retainDbCount === 'number' ? retainDbCount : (oldConfig.retainDbCount !== undefined ? oldConfig.retainDbCount : 7),
         retainFilesCount: typeof retainFilesCount === 'number' ? retainFilesCount : (oldConfig.retainFilesCount !== undefined ? oldConfig.retainFilesCount : 4),
         destination: destination || oldConfig.destination || 'local',
+        localBackupPath: localBackupPath !== undefined ? localBackupPath : (oldConfig.localBackupPath || ''),
         lastRunTimestamp: oldConfig.lastRunTimestamp || null,
         nextRunTimestamp: null
     };
@@ -1383,9 +1410,10 @@ app.delete('/api/sites/:siteId/backups/:backupId', requireAuth, async (req, res)
 
     const entry = site.backupHistory[entryIdx];
     const orchestrator = new SafeUpdateOrchestrator(site);
+    const custom_path = site.backupConfig ? site.backupConfig.localBackupPath : '';
 
     // Call remote worker API to physically delete local backup or cloud S3 object
-    await orchestrator.deleteRemoteBackup(entry);
+    await orchestrator.deleteRemoteBackup(entry, custom_path);
 
     // Remove from history
     site.backupHistory.splice(entryIdx, 1);
@@ -1411,16 +1439,20 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
         return res.status(404).json({ error: 'Site not found.' });
     }
 
+    const orchestrator = new SafeUpdateOrchestrator(site);
     const timestamp = Date.now();
     const backupId = 'bak_manual_' + timestamp;
+
+    const final_destination_for_entry = destination || (site.backupConfig ? site.backupConfig.destination : "local");
+    const branded_manual_archive_name = orchestrator.generateBackupFilename(site.name, 'manual', backupId);
 
     const newBackup = {
         backupId: backupId,
         timestamp: new Date(timestamp).toISOString(),
         type: "manual",
         scope: scope || "full",
-        destination: destination || site.backupConfig.destination || "local",
-        archiveName: "",
+        destination: final_destination_for_entry,
+        archiveName: branded_manual_archive_name,
         s3Key: "",
         localPath: "",
         fileSize: "Pending...",
@@ -1432,18 +1464,22 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
     db.sites[siteIdx].backupHistory.push(newBackup);
     saveDB(db);
 
-    const orchestrator = new SafeUpdateOrchestrator(site);
+    const final_destination = destination || (site.backupConfig ? site.backupConfig.destination : "local");
+    const customLocalPath = (final_destination === 'local' && site.backupConfig) ? (site.backupConfig.localBackupPath || '') : '';
+    const brandedArchiveName = orchestrator.generateBackupFilename(site.name, 'manual', backupId);
 
     // Run asynchronously
     (async () => {
         try {
             const backupPayload = {
-                backup_destination: destination || site.backupConfig.destination || 'local',
+                backup_destination: final_destination,
                 s3_bucket: site.s3Config.bucket,
                 s3_endpoint: site.s3Config.endpoint,
                 s3_region: site.s3Config.region,
                 s3_access_key: site.s3Config.accessKey,
-                s3_secret_key: site.s3Config.secretKey
+                s3_secret_key: site.s3Config.secretKey,
+                local_backup_path: customLocalPath,
+                archive_name: brandedArchiveName
             };
 
             const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);

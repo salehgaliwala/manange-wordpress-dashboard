@@ -1313,6 +1313,20 @@
                                                             </div>
                                                         </div>
 
+                                                        {backupConfig.destination === 'local' && (
+                                                            <div className="pt-2">
+                                                                <label className="text-slate-400 font-semibold block mb-1">Custom Local Storage Path (Outside Webroot)</label>
+                                                                <input
+                                                                    type="text"
+                                                                    value={backupConfig.localBackupPath || ''}
+                                                                    onChange={(e) => setBackupConfig({...backupConfig, localBackupPath: e.target.value})}
+                                                                    placeholder="e.g. /var/backups/wp-central/"
+                                                                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 font-mono text-slate-100"
+                                                                />
+                                                                <span className="text-[10px] text-slate-500 block mt-0.5">Absolute path. Overrides standard /wp-content/uploads/wp-central-backups location.</span>
+                                                            </div>
+                                                        )}
+
                                                         <div className="grid grid-cols-2 gap-3">
                                                             <div>
                                                                 <label className="text-slate-400 font-semibold block mb-1">Retain Database Backups</label>
