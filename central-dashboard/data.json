@@ -32,19 +32,39 @@
         "retainFilesCount": 2,
         "destination": "local",
         "localBackupPath": "/var/backups/custom-isolated-wp-central/",
-        "lastRunTimestamp": null,
-        "nextRunTimestamp": 1785466800000
+        "lastRunTimestamp": 1785476085383,
+        "nextRunTimestamp": 1785553200000
       },
       "backupHistory": [
         {
-          "backupId": "bak_manual_restore_test_123",
-          "timestamp": "2026-07-30T19:47:56.992Z",
+          "backupId": "bak_manual_existing",
+          "timestamp": "2026-07-28T01:00:00Z",
           "type": "manual",
           "scope": "full",
           "destination": "local",
           "status": "completed",
-          "fileSize": "1 KB",
-          "localPath": "/app/central-dashboard/temp_uploads/wp-central-backups-test/test_branded_backup.zip"
+          "fileSize": "350 MB"
+        },
+        {
+          "backupId": "bak_sched_4",
+          "timestamp": "2026-07-28T05:00:00Z",
+          "type": "scheduled",
+          "scope": "full",
+          "destination": "local",
+          "status": "completed",
+          "fileSize": "350 MB"
+        },
+        {
+          "backupId": "bak_manual_1785477867508",
+          "timestamp": "2026-07-31T06:04:27.508Z",
+          "type": "manual",
+          "scope": "full",
+          "destination": "local",
+          "archiveName": "Local_WP_Container_backup_2026-07-31_060427_manual_1785.zip",
+          "s3Key": "",
+          "localPath": "",
+          "fileSize": "0 KB",
+          "status": "failed"
         }
       ]
     }
@@ -56,7 +76,7 @@
       "version": "2.1.4",
       "author": "Vault Development Corp",
       "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-28T05:55:46.875Z"
+      "uploadedAt": "2026-07-31T06:14:30.963Z"
     }
   },
   "jobs": {
@@ -392,6 +412,51 @@
         "fullPath": "/app/central-dashboard/temp_uploads/wp-central-backups-test/test_branded_backup.zip",
         "s3Key": ""
       }
+    },
+    "job_backup_1785477571948": {
+      "id": "job_backup_1785477571948",
+      "siteId": "example-wp-site",
+      "status": "failed",
+      "progress": 100,
+      "step": "⚠️ Backup failed: ",
+      "error": "",
+      "completed": false,
+      "type": "backup",
+      "backupId": "bak_manual_1785477571948"
+    },
+    "job_backup_1785477867508": {
+      "id": "job_backup_1785477867508",
+      "siteId": "example-wp-site",
+      "status": "failed",
+      "progress": 100,
+      "step": "⚠️ Backup failed: ",
+      "error": "",
+      "completed": false,
+      "type": "backup",
+      "backupId": "bak_manual_1785477867508"
+    },
+    "job_dashboard_1785478470969": {
+      "id": "job_dashboard_1785478470969",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "skip_backup": false,
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3",
+        "skip_backup": false,
+        "siteName": "Local WP Container",
+        "local_backup_path": "",
+        "archive_name": "Local_WP_Container_backup_2026-07-31_061430_update_1785.zip"
+      },
+      "resumable": true
     }
   }
 }

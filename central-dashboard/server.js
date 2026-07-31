@@ -1464,6 +1464,20 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
     db.sites[siteIdx].backupHistory.push(newBackup);
     saveDB(db);
 
+    const backupJobId = 'job_backup_' + timestamp;
+    const initialBackupJobState = {
+        id: backupJobId,
+        siteId: siteId,
+        status: 'processing',
+        progress: 10,
+        step: 'Initializing backup pipeline connection...',
+        error: null,
+        completed: false,
+        type: 'backup',
+        backupId: backupId
+    };
+    saveActiveJob(backupJobId, initialBackupJobState);
+
     const final_destination = destination || (site.backupConfig ? site.backupConfig.destination : "local");
     const customLocalPath = (final_destination === 'local' && site.backupConfig) ? (site.backupConfig.localBackupPath || '') : '';
     const brandedArchiveName = orchestrator.generateBackupFilename(site.name, 'manual', backupId);
@@ -1485,7 +1499,14 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
             const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
             const { job_id: remote_job_id } = response.data;
 
-            const backupJob = await orchestrator.pollBackupStatus(remote_job_id);
+            const backupJob = await orchestrator.pollBackupStatus(remote_job_id, (progress, step) => {
+                const currentDB = loadDB();
+                if (currentDB.jobs && currentDB.jobs[backupJobId]) {
+                    currentDB.jobs[backupJobId].progress = progress;
+                    currentDB.jobs[backupJobId].step = step;
+                    saveDB(currentDB);
+                }
+            });
 
             const finalDB = loadDB();
             const currentSite = finalDB.sites.find(s => s.id === siteId);
@@ -1502,8 +1523,14 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
                         currentSite.backupHistory[hIdx].localPath = backupJob.local_backup_path || '';
                     }
                 }
-                saveDB(finalDB);
             }
+            if (finalDB.jobs && finalDB.jobs[backupJobId]) {
+                finalDB.jobs[backupJobId].status = 'completed';
+                finalDB.jobs[backupJobId].progress = 100;
+                finalDB.jobs[backupJobId].step = '✓ System backup successfully completed!';
+                finalDB.jobs[backupJobId].completed = true;
+            }
+            saveDB(finalDB);
         } catch (err) {
             console.error('[Manual Backup Now Error]', err.message);
             const finalDB = loadDB();
@@ -1514,8 +1541,14 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
                     currentSite.backupHistory[hIdx].status = "failed";
                     currentSite.backupHistory[hIdx].fileSize = "0 KB";
                 }
-                saveDB(finalDB);
             }
+            if (finalDB.jobs && finalDB.jobs[backupJobId]) {
+                finalDB.jobs[backupJobId].status = 'failed';
+                finalDB.jobs[backupJobId].progress = 100;
+                finalDB.jobs[backupJobId].step = `⚠️ Backup failed: ${err.message}`;
+                finalDB.jobs[backupJobId].error = err.message;
+            }
+            saveDB(finalDB);
         }
     })();
 
