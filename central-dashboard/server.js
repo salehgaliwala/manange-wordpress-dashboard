@@ -1464,6 +1464,20 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
     db.sites[siteIdx].backupHistory.push(newBackup);
     saveDB(db);
 
+    const backupJobId = 'job_backup_' + timestamp;
+    const initialBackupJobState = {
+        id: backupJobId,
+        siteId: siteId,
+        status: 'processing',
+        progress: 10,
+        step: 'Initializing backup pipeline connection...',
+        error: null,
+        completed: false,
+        type: 'backup',
+        backupId: backupId
+    };
+    saveActiveJob(backupJobId, initialBackupJobState);
+
     const final_destination = destination || (site.backupConfig ? site.backupConfig.destination : "local");
     const customLocalPath = (final_destination === 'local' && site.backupConfig) ? (site.backupConfig.localBackupPath || '') : '';
     const brandedArchiveName = orchestrator.generateBackupFilename(site.name, 'manual', backupId);
@@ -1485,7 +1499,14 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
             const response = await orchestrator.signedPost('/wp-json/wp-central/v1/backup', backupPayload);
             const { job_id: remote_job_id } = response.data;
 
-            const backupJob = await orchestrator.pollBackupStatus(remote_job_id);
+            const backupJob = await orchestrator.pollBackupStatus(remote_job_id, (progress, step) => {
+                const currentDB = loadDB();
+                if (currentDB.jobs && currentDB.jobs[backupJobId]) {
+                    currentDB.jobs[backupJobId].progress = progress;
+                    currentDB.jobs[backupJobId].step = step;
+                    saveDB(currentDB);
+                }
+            });
 
             const finalDB = loadDB();
             const currentSite = finalDB.sites.find(s => s.id === siteId);
@@ -1502,8 +1523,14 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
                         currentSite.backupHistory[hIdx].localPath = backupJob.local_backup_path || '';
                     }
                 }
-                saveDB(finalDB);
             }
+            if (finalDB.jobs && finalDB.jobs[backupJobId]) {
+                finalDB.jobs[backupJobId].status = 'completed';
+                finalDB.jobs[backupJobId].progress = 100;
+                finalDB.jobs[backupJobId].step = '✓ System backup successfully completed!';
+                finalDB.jobs[backupJobId].completed = true;
+            }
+            saveDB(finalDB);
         } catch (err) {
             console.error('[Manual Backup Now Error]', err.message);
             const finalDB = loadDB();
@@ -1514,14 +1541,90 @@ app.post('/api/sites/:siteId/backup-now', requireAuth, async (req, res) => {
                     currentSite.backupHistory[hIdx].status = "failed";
                     currentSite.backupHistory[hIdx].fileSize = "0 KB";
                 }
-                saveDB(finalDB);
             }
+            if (finalDB.jobs && finalDB.jobs[backupJobId]) {
+                finalDB.jobs[backupJobId].status = 'failed';
+                finalDB.jobs[backupJobId].progress = 100;
+                finalDB.jobs[backupJobId].step = `⚠️ Backup failed: ${err.message}`;
+                finalDB.jobs[backupJobId].error = err.message;
+            }
+            saveDB(finalDB);
         }
     })();
 
     return res.status(202).json({
         message: 'Manual backup pipeline triggered successfully.',
         backupId: backupId
+    });
+});
+
+/**
+ * POST /api/sites/:siteId/restore
+ * Triggers a full-stack asynchronous restoration job.
+ * Protected by requireAuth
+ */
+app.post('/api/sites/:siteId/restore', requireAuth, async (req, res) => {
+    const { siteId } = req.params;
+    const { backupId, source, fullPath, s3Key } = req.body;
+
+    const db = loadDB();
+    const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
+    if (!site) {
+        return res.status(404).json({ error: 'Site not found.' });
+    }
+
+    const jobId = 'job_restore_' + Date.now();
+
+    const initialRestoreJobState = {
+        id: jobId,
+        siteId: siteId,
+        status: 'processing',
+        progress: 5,
+        step: 'Initializing restoration pipeline connection...',
+        error: null,
+        completed: false,
+        type: 'restore',
+        restoreParams: { backupId, source, fullPath, s3Key }
+    };
+
+    saveActiveJob(jobId, initialRestoreJobState);
+
+    const orchestrator = new SafeUpdateOrchestrator(site);
+
+    // Launch restoration pipeline asynchronously
+    orchestrator.executeSiteRestore(
+        { jobId, source, fullPath, s3Key },
+        (progress, step) => {
+            const currentDB = loadDB();
+            if (currentDB.jobs && currentDB.jobs[jobId]) {
+                currentDB.jobs[jobId].progress = progress;
+                currentDB.jobs[jobId].step = step;
+                saveDB(currentDB);
+            }
+        }
+    ).then(result => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'completed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = '✓ Restoration complete! All database tables and files restored successfully.';
+            currentDB.jobs[jobId].completed = true;
+            saveDB(currentDB);
+        }
+    }).catch(err => {
+        const currentDB = loadDB();
+        if (currentDB.jobs && currentDB.jobs[jobId]) {
+            currentDB.jobs[jobId].status = 'failed';
+            currentDB.jobs[jobId].progress = 100;
+            currentDB.jobs[jobId].step = `⚠️ Restoration failed: ${err.message}`;
+            currentDB.jobs[jobId].error = err.message;
+            saveDB(currentDB);
+        }
+    });
+
+    return res.status(202).json({
+        status: 'accepted',
+        job_id: jobId
     });
 });
 

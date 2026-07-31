@@ -579,6 +579,83 @@ class SafeUpdateOrchestrator {
             console.error(`[Orchestrator] Failed to delete backup ${backupEntry.backupId}:`, err.message);
         }
     }
+
+    /**
+     * Executes Site Restoration end-to-end on target site
+     * @param {Object} restoreParams Parameters including source, fullPath, s3Key, jobId, etc.
+     * @param {Function} onStep Progress notification callback
+     */
+    async executeSiteRestore(restoreParams, onStep) {
+        const jobId = restoreParams.jobId;
+        console.log(`\n=== Starting Site Restoration Pipeline for Job: ${jobId} ===`);
+
+        try {
+            if (onStep) onStep(15, 'Initiating restoration connection with target WordPress site...');
+
+            const payload = {
+                source: restoreParams.source || 'local',
+                full_path: restoreParams.fullPath || '',
+                s3_key: restoreParams.s3Key || '',
+                s3_config: {
+                    bucket: this.s3Config.bucket,
+                    endpoint: this.s3Config.endpoint,
+                    region: this.s3Config.region,
+                    access_key: this.s3Config.accessKey,
+                    secret_key: this.s3Config.secretKey
+                }
+            };
+
+            const response = await this.signedPost('/wp-json/wp-central/v1/restore', payload);
+            const { job_id: remote_job_id } = response.data;
+            console.log(`[Restoration] Target accepted restore. Remote Job ID: ${remote_job_id}`);
+
+            if (onStep) onStep(30, 'Target site entering maintenance mode...');
+
+            // Poll target status
+            let lastProgress = -1;
+            let lastUpdateTime = Date.now();
+            const intervalMs = 2500;
+
+            while (true) {
+                try {
+                    const statusRes = await this.signedGet('/wp-json/wp-central/v1/job-status', { job_id: remote_job_id });
+                    const remoteJob = statusRes.data;
+                    console.log(`[Restoration Poller] Status: ${remoteJob.status}, Progress: ${remoteJob.progress}%, Step: ${remoteJob.step_message}`);
+
+                    if (onStep) {
+                        const stepMsg = remoteJob.step_message || 'Restoring database and files...';
+                        onStep(remoteJob.progress, stepMsg);
+                    }
+
+                    if (remoteJob.status === 'completed') {
+                        break;
+                    }
+                    if (remoteJob.status === 'failed') {
+                        throw new Error(`Restoration worker failed with error: ${remoteJob.error}`);
+                    }
+
+                    if (remoteJob.progress !== lastProgress) {
+                        lastProgress = remoteJob.progress;
+                        lastUpdateTime = Date.now();
+                    } else if (Date.now() - lastUpdateTime > 3600000) { // 1 hour stall safeguard
+                        throw new Error('Restoration progress stalled for more than 1 hour.');
+                    }
+                } catch (err) {
+                    console.warn(`[Restoration Poller] Warn: Status poll failed temporarily. Error: ${err.message}`);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, intervalMs));
+            }
+
+            if (onStep) onStep(100, '✓ Site restoration successfully completed!');
+            return { success: true, message: 'Site restored successfully.' };
+
+        } catch (error) {
+            console.error('\n[FATAL RESTORATION FAILURE]', error.message);
+            if (onStep) onStep(0, `⚠️ Restoration failed: ${error.message}`);
+            throw error;
+        }
+    }
 }
 
 module.exports = SafeUpdateOrchestrator;

@@ -17,11 +17,16 @@ The system is composed of two primary components:
   - Tracks incoming requests using transients to guarantee each signature is used exactly once.
 - **Timing Attack Resistance**: Uses PHP's native timing-safe `hash_equals` function to evaluate signatures.
 
-### 2. Asynchronous S3-Compatible Backup Engine
+### 2. Asynchronous S3-Compatible Backup Engine & Isolated Storage Path
 - **Non-blocking Loopback Process**: A request to `POST /backup` returns `202 Accepted` immediately with a unique Job ID. The plugin triggers an internal asynchronous loopback POST (`/backup-process`) in the background.
 - **Pure-PHP SQL Export**: Dumps the complete WordPress database layout and record queries without depending on external binaries like `mysqldump`.
-- **Zip Compression**: Archives the whole `/wp-content/` directory recursively. Prevents infinite loops by explicitly excluding the active temporary backup workspace.
-- **AWS Signature V4 REST Client**: Built-in, zero-dependency lightweight S3 client in PHP. Streams and uploads backup archives directly to any S3-compatible cloud storage endpoint (AWS, MinIO, DigitalOcean Spaces, etc.) securely.
+- **Zip Compression**: Archives the whole `/wp-content/` directory recursively. Prevents infinite loops by explicitly excluding both the temporary workspace and the configured custom isolated backups directory.
+- **Isolated Storage Paths**: Supports specifying custom absolute system paths outside the WordPress root folder (e.g., `/var/backups/wp-central/`) for both pre-update manual backups and scheduled backups when destination is set to `local`.
+- **Branded File Naming Format**: Standardizes ZIP archive filenames across the system using the site name:
+  `Format: {Sanitized_Site_Name}_backup_{YYYY-MM-DD_HHmmss}_{JobType}_{ShortJobId}.zip`
+  `Example: Northstar_Health_backup_2026-07-30_143000_update_a8f9.zip`
+- **AWS Signature V4 REST Client**: Built-in, zero-dependency lightweight S3 client in PHP. Streams and uploads backup archives directly to any S3-compatible cloud storage endpoint securely.
+- **Secure File Cleanup**: Includes a verified `/delete-backup` endpoint protected from directory traversal (using strict `..` and prefix authorization checks) allowing deletion of remote S3 files and custom local files.
 
 ### 3. "Safe Update" Pipeline & Premium Plugin Vault (Dashboard Orchestration)
 The central orchestrator automates a zero-downtime, safe update workflow across target sites:
@@ -32,6 +37,14 @@ The central orchestrator automates a zero-downtime, safe update workflow across 
   - **Premium Vault Sideload**: If updating a custom or premium plugin, the dashboard automatically parses the `.zip` file, extracts metadata headers, registers the slug, signs a secure pre-signed download token, and injects a `package_url` payload. The worker plugin downloads this custom package securely via `download_url()` and overwrites/installs the plugin.
 - **Step D (Post-Screenshot)**: Captures a secondary post-update screenshot of the live site.
 - **Step E (Visual Regression Analysis)**: Compares the pre- and post-screenshots pixel-by-pixel using `pixelmatch`. If the mismatch exceeds **2%**, it logs a high-severity alert, flags the site for manual review, or triggers a rollback.
+
+### 4. Automated Backup Scheduling & UpdraftPlus-style Auto-Pruning
+- **Background Dispatcher**: Uses a 15-second Express interval loop to automatically check configured schedule requirements (Hourly, Twice Daily, Daily, Weekly, Fortnightly, Monthly) and dispatch asynchronous background backups.
+- **UpdraftPlus-style Pruning Rules**: Allows administrators to specify independent database (`retainDbCount`) and file (`retainFilesCount`) retention limits. When limits are exceeded, the dashboard automatically deletes the oldest scheduled backups from remote S3 or local disks via the worker plugin.
+- **Safety Gates**: Strictly protects user-triggered manual snapshots and pre-update archives from being auto-pruned.
+- **Tab-based Detail Drawer UI**: Splits the site details view into two functional tabs:
+  - **Updates Manager**: Coordinate safe update runs, select-to-upgrade plugins, and toggle pre-update automatic backup checkboxes.
+  - **Updraft-style Backup Manager**: Fine-tune automated scheduling configurations, select storage destinations, customize absolute isolated path directories, trigger instantaneous manual backups, and review granular historical log tables with complete deletion controls.
 
 ---
 
@@ -46,6 +59,7 @@ The central orchestrator automates a zero-downtime, safe update workflow across 
 │   ├── server.js                # Protected Express REST server with JWT/Bearer login (Node.js)
 │   ├── test-pipeline.js         # Integration test/mock visual regression runner (Node.js)
 │   ├── test-vault.js            # Premium/Custom Plugin Vault integration test (Node.js)
+│   ├── test-backup-scheduler.js # Automated Scheduling and Updraft-style Auto-Pruning test (Node.js)
 │   └── package.json             # Node dependencies and scripts
 └── README.md                    # System documentation
 ```
@@ -150,4 +164,10 @@ npm run test-pipeline
 ```bash
 cd central-dashboard
 node test-vault.js
+```
+
+### Test Automated Backup Scheduling, Isolated Storage Paths, and UpdraftPlus Pruning:
+```bash
+cd central-dashboard
+node test-backup-scheduler.js
 ```

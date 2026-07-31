@@ -149,6 +149,13 @@
             // Optional automated backups before updates (default: true)
             const [takeBackup, setTakeBackup] = useState(true);
 
+            // Active job type ('update' or 'restore')
+            const [jobType, setJobType] = useState('update');
+
+            // Restoration state variables
+            const [restoringBackup, setRestoringBackup] = useState(null);
+            const [confirmSiteText, setConfirmSiteText] = useState('');
+
             // Polling interval ref
             const pollerRef = useRef(null);
 
@@ -506,41 +513,73 @@
                 }
             };
 
-            // Start Real-Time Job Progress Polling on backend
-            const startPollingJob = (jobId) => {
-                if (pollerRef.current) clearInterval(pollerRef.current);
-                setJobFailed(false);
+            // Background Jobs list state
+            const [activeJobs, setActiveJobs] = useState([]);
 
-                pollerRef.current = setInterval(async () => {
+            // Periodically poll active background jobs
+            useEffect(() => {
+                if (!isAuthenticated) return;
+
+                const fetchActiveJobs = async () => {
                     try {
-                        const res = await fetch(`/api/jobs/${jobId}`);
+                        const res = await fetch('/api/jobs/active');
                         if (res.ok) {
-                            const job = await res.json();
-                            setJobProgress(job.progress);
-                            setJobStep(job.step);
-
-                            if (job.status === 'completed') {
-                                clearInterval(pollerRef.current);
-                                setFinalBackupPath(job.backup_path || 'S3 Cloud Storage Bucket');
-                                fetchSites(); // Sync main dashboard stats
-                            } else if (job.status === 'failed') {
-                                clearInterval(pollerRef.current);
-                                setJobFailed(true);
-                                fetchSites();
-                            }
+                            const data = await res.json();
+                            setActiveJobs(data);
                         }
                     } catch (err) {
-                        console.error('Error polling active job:', err);
+                        console.error('Failed to fetch active jobs:', err);
                     }
-                }, 2000);
+                };
+
+                fetchActiveJobs(); // immediate fetch
+                const jobsInterval = setInterval(fetchActiveJobs, 2000);
+
+                return () => clearInterval(jobsInterval);
+            }, [isAuthenticated]);
+
+            const handleKillJob = async (jobId) => {
+                try {
+                    const res = await fetch(`/api/jobs/${jobId}/kill`, { method: 'POST' });
+                    if (res.ok) {
+                        alert('Kill signal dispatched successfully.');
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to kill job.');
+                    }
+                } catch (err) {
+                    alert('Error dispatching kill signal.');
+                }
             };
 
-            // Cleanup poller on unmount
-            useEffect(() => {
-                return () => {
-                    if (pollerRef.current) clearInterval(pollerRef.current);
-                };
-            }, []);
+            const handleResumeJob = async (jobId) => {
+                try {
+                    const res = await fetch(`/api/jobs/${jobId}/resume`, { method: 'POST' });
+                    if (res.ok) {
+                        alert('Job resumption initiated successfully.');
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to resume job.');
+                    }
+                } catch (err) {
+                    alert('Error resuming job.');
+                }
+            };
+
+            const handleDeleteJob = async (jobId) => {
+                try {
+                    const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+                    if (res.ok) {
+                        // immediate optimistic filter
+                        setActiveJobs(prev => prev.filter(j => j.id !== jobId));
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to delete job.');
+                    }
+                } catch (err) {
+                    alert('Error deleting job.');
+                }
+            };
 
             // Automated Safe Update Pipeline Execution
             const triggerSafeUpdatePipeline = async (type, specifiedPlugins = []) => {
@@ -564,17 +603,54 @@
 
                     if (res.status === 202) {
                         const data = await res.json();
-                        setActiveJobId(data.job_id);
-                        // Launch active progress poller
-                        startPollingJob(data.job_id);
+                        // Job will be picked up automatically by global jobs interval poller
                     } else {
                         const data = await res.json();
                         alert(data.error || 'Failed to start safe update pipeline.');
-                        setActiveJobId(null);
                     }
                 } catch (err) {
                     alert('Network error executing update pipeline.');
                     setActiveJobId(null);
+                }
+            };
+
+            const handleInitiateRestore = (backup) => {
+                setRestoringBackup(backup);
+                setConfirmSiteText('');
+            };
+
+            const handleExecuteRestore = async () => {
+                if (!viewingSite || !restoringBackup) return;
+
+                const backup = restoringBackup;
+                setRestoringBackup(null);
+                setViewingSite(null); // Close the slide-out drawer
+                setActiveJobId('initializing...');
+                setJobProgress(10);
+                setJobStep('Initializing restoration pipeline...');
+                setJobType('restore');
+
+                try {
+                    const res = await fetch(`/api/sites/${viewingSite.id}/restore`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            backupId: backup.backupId,
+                            source: backup.destination,
+                            fullPath: backup.localPath || '',
+                            s3Key: backup.s3Key || ''
+                        })
+                    });
+
+                    if (res.status === 202) {
+                        const data = await res.json();
+                        // Job will be picked up automatically by global jobs interval poller
+                    } else {
+                        const data = await res.json();
+                        alert(data.error || 'Failed to start restoration pipeline.');
+                    }
+                } catch (err) {
+                    alert('Network error executing restoration pipeline.');
                 }
             };
 
@@ -747,62 +823,121 @@
                             </div>
                         </div>
 
-                        {/* Direct Update Progress bar indicator - REAL TIME POLLED FROM BACKEND */}
-                        {activeJobId && (
-                            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-4 animate-fadeIn">
-                                <div className="flex justify-between items-center">
-                                    <div>
-                                        <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                                            {!jobFailed && jobProgress < 100 ? (
-                                                <span className="flex h-2 w-2 relative">
-                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-                                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-                                                </span>
-                                            ) : null}
-                                            {jobFailed ? '⚠️ Automated Update Pipeline Failed' : 'Automated Update Pipeline Progress'}
-                                        </h3>
-                                        <p className="text-xs text-slate-400 font-mono mt-0.5">Job ID: {activeJobId}</p>
-                                    </div>
-                                    <button
-                                        onClick={() => {
-                                            setActiveJobId(null);
-                                            setJobFailed(false);
-                                        }}
-                                        className="text-xs text-slate-500 hover:text-slate-100 bg-slate-950 px-2.5 py-1 border border-slate-800 rounded-md"
-                                    >
-                                        Dismiss
-                                    </button>
-                                </div>
+                        {/* Background Job progress indicator cards - REAL TIME POLLED FROM BACKEND */}
+                        {activeJobs.length > 0 && (
+                            <div className="space-y-4 animate-fadeIn">
+                                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active & Recent Background Pipelines ({activeJobs.length})</h3>
+                                {activeJobs.map((job) => {
+                                    const isJobActive = job.status === 'processing';
+                                    const isJobFailed = job.status === 'failed' || job.status === 'broken';
+                                    const isJobKilled = job.status === 'killed';
+                                    const isJobCompleted = job.status === 'completed';
 
-                                <div className="space-y-2">
-                                    <div className="flex justify-between items-center text-xs font-semibold">
-                                        <span className={jobFailed ? 'text-rose-400' : 'text-violet-400'}>{jobStep}</span>
-                                        <span className="text-slate-300 font-mono text-sm font-bold">{jobProgress}%</span>
-                                    </div>
-                                    <div className="w-full bg-slate-950 rounded-full h-3 border border-slate-800 overflow-hidden p-0.5">
-                                        <div
-                                            className={`h-full rounded-full transition-all duration-500 ${
-                                                jobFailed ? 'bg-rose-600' : 'bg-gradient-to-r from-violet-600 to-indigo-500'
-                                            }`}
-                                            style={{ width: `${jobProgress}%` }}
-                                        />
-                                    </div>
-                                </div>
+                                    let title = '📦 Automated Update Pipeline';
+                                    if (job.type === 'restore') {
+                                        title = '🔄 Site Restoration Pipeline';
+                                    } else if (job.type === 'backup') {
+                                        title = '💾 System Backup Pipeline';
+                                    }
 
-                                {jobProgress >= 100 && !jobFailed && (
-                                    <div className="pt-4 border-t border-slate-800">
-                                        <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
-                                            <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
-                                            <p className="text-xs text-slate-300">
-                                                WordPress core and plugin packages have been safely updated directly on the worker. The previous system files and database were archived and secure.
-                                            </p>
-                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
-                                                <span className="text-slate-500 font-semibold">Backup Scope:</span> /wp-content/ directory & MySQL Database Dump (Skip non-readable files: Enabled)<br/>
-                                                <span className="text-slate-500 font-semibold">Backup Storage Destination:</span> {finalBackupPath}
+                                    return (
+                                        <div key={job.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-4 relative overflow-hidden">
+                                            <div className="flex justify-between items-start">
+                                                <div className="space-y-1">
+                                                    <h4 className="text-sm font-black text-slate-100 flex items-center gap-2">
+                                                        {isJobActive && (
+                                                            <span className="flex h-2 w-2 relative">
+                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+                                                                <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
+                                                            </span>
+                                                        )}
+                                                        {title}
+                                                    </h4>
+                                                    <p className="text-xs text-slate-500 font-mono">Job ID: {job.id} <span className="uppercase text-[10px] ml-2 font-bold px-1.5 py-0.5 rounded bg-slate-950 border border-slate-850 text-slate-400">{job.status}</span></p>
+                                                </div>
+
+                                                <div className="flex items-center gap-2">
+                                                    {isJobActive && (
+                                                        <button
+                                                            onClick={() => handleKillJob(job.id)}
+                                                            className="text-xs bg-rose-950/20 hover:bg-rose-900 text-rose-300 font-bold px-3 py-1.5 rounded-lg border border-rose-850/20 transition"
+                                                        >
+                                                            Kill Job
+                                                        </button>
+                                                    )}
+
+                                                    {job.status === 'broken' && (
+                                                        <button
+                                                            onClick={() => handleResumeJob(job.id)}
+                                                            className="text-xs bg-emerald-950/20 hover:bg-emerald-900 text-emerald-300 font-bold px-3 py-1.5 rounded-lg border border-emerald-850/20 transition"
+                                                        >
+                                                            Resume Job
+                                                        </button>
+                                                    )}
+
+                                                    {!isJobActive && (
+                                                        <button
+                                                            onClick={() => handleDeleteJob(job.id)}
+                                                            className="text-xs text-slate-500 hover:text-slate-100 bg-slate-950 px-2.5 py-1.5 border border-slate-800 rounded-lg transition"
+                                                        >
+                                                            Delete Card
+                                                        </button>
+                                                    )}
+                                                </div>
                                             </div>
+
+                                            <div className="space-y-2">
+                                                <div className="flex justify-between items-center text-xs font-semibold">
+                                                    <span className={isJobFailed ? 'text-rose-400' : 'text-violet-400'}>
+                                                        {job.step || job.step_message || 'Processing...'}
+                                                    </span>
+                                                    <span className="text-slate-300 font-mono text-sm font-bold">{job.progress || 0}%</span>
+                                                </div>
+                                                <div className="w-full bg-slate-950 rounded-full h-3 border border-slate-800 overflow-hidden p-0.5">
+                                                    <div
+                                                        className={`h-full rounded-full transition-all duration-500 ${
+                                                            isJobFailed ? 'bg-rose-600' : 'bg-gradient-to-r from-violet-600 to-indigo-500'
+                                                        }`}
+                                                        style={{ width: `${job.progress || 0}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+
+                                            {isJobCompleted && (
+                                                <div className="pt-4 border-t border-slate-800">
+                                                    {job.type === 'restore' ? (
+                                                        <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-3">
+                                                            <span className="text-emerald-400 font-bold block text-sm">✓ Restoration Successful</span>
+                                                            <p className="text-xs text-slate-300">
+                                                                WordPress database tables and files have been successfully restored.
+                                                            </p>
+                                                            <div className="pt-2">
+                                                                <a
+                                                                    href="http://localhost:8080/"
+                                                                    target="_blank"
+                                                                    rel="noopener noreferrer"
+                                                                    className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2.5 rounded-lg transition"
+                                                                >
+                                                                    Verify Restored Site Live ↗
+                                                                </a>
+                                                            </div>
+                                                        </div>
+                                                    ) : (
+                                                        <div className="bg-emerald-950/20 border border-emerald-800/40 p-4 rounded-xl space-y-2">
+                                                            <span className="text-emerald-400 font-bold block text-sm">✓ Pipeline Execution Successful</span>
+                                                            <p className="text-xs text-slate-300">
+                                                                Updates completed cleanly on remote site.
+                                                            </p>
+                                                            <div className="text-[11px] font-mono text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
+                                                                <span className="text-slate-500 font-semibold">Backup Storage:</span> {job.backup_path || 'S3 Cloud Storage'}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
-                                    </div>
-                                )}
+                                    );
+                                })}
                             </div>
                         )}
 
@@ -1435,6 +1570,13 @@
                                                                                     <>
                                                                                         <button
                                                                                             type="button"
+                                                                                            onClick={() => handleInitiateRestore(backup)}
+                                                                                            className="text-amber-500 hover:text-amber-400 font-bold mr-2.5"
+                                                                                        >
+                                                                                            Restore Site
+                                                                                        </button>
+                                                                                        <button
+                                                                                            type="button"
                                                                                             onClick={() => {
                                                                                                 if (backup.localPath) {
                                                                                                     alert(`Download Path: ${backup.localPath}`);
@@ -1451,7 +1593,7 @@
                                                                                         <button
                                                                                             type="button"
                                                                                             onClick={() => handleDeleteBackupEntry(backup.backupId)}
-                                                                                            className="text-rose-400 hover:text-rose-300 font-bold ml-1"
+                                                                                            className="text-rose-400 hover:text-rose-300 font-bold ml-2.5"
                                                                                         >
                                                                                             Delete
                                                                                         </button>
@@ -1468,6 +1610,63 @@
                                             </div>
                                         </div>
                                     )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Confirmation Safety Modal for Site Restoration */}
+                    {restoringBackup && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-[60] animate-fadeIn">
+                            <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl w-full max-w-lg space-y-5 shadow-2xl">
+                                <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                                    <h3 className="text-lg font-black text-amber-500 flex items-center gap-2">
+                                        <span>⚠️ High-Priority Safety Confirmation</span>
+                                    </h3>
+                                    <button
+                                        onClick={() => setRestoringBackup(null)}
+                                        className="text-slate-400 hover:text-slate-100 font-bold text-lg"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                <div className="p-4 rounded-xl bg-amber-950/20 border border-amber-900/50 space-y-3">
+                                    <p className="text-xs text-amber-200 font-semibold leading-relaxed">
+                                        ⚠️ <strong className="text-amber-400">CRITICAL WARNING</strong>: Restoring <strong className="underline text-slate-100">{viewingSite?.name}</strong> will overwrite all existing database tables and <code className="bg-slate-950 px-1 py-0.5 rounded">/wp-content/</code> files with the data from <strong className="text-slate-100">{restoringBackup.timestamp ? new Date(restoringBackup.timestamp).toUTCString() : 'the backup archive'}</strong>. This action cannot be undone.
+                                    </p>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-xs font-bold text-slate-400 block">
+                                        Type the site name to confirm: <span className="font-mono text-slate-200 select-all font-black">{viewingSite?.name}</span>
+                                    </label>
+                                    <input
+                                        type="text"
+                                        required
+                                        value={confirmSiteText}
+                                        onChange={(e) => setConfirmSiteText(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono"
+                                        placeholder="Type site name exactly..."
+                                    />
+                                </div>
+
+                                <div className="flex gap-3 justify-end pt-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setRestoringBackup(null)}
+                                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-4 py-2.5 rounded-lg font-bold"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleExecuteRestore}
+                                        disabled={confirmSiteText.trim().toLowerCase() !== viewingSite?.name.toLowerCase()}
+                                        className="bg-amber-600 hover:bg-amber-700 text-white text-xs px-5 py-2.5 rounded-lg font-bold transition disabled:opacity-40"
+                                    >
+                                        I understand, proceed with restoration
+                                    </button>
                                 </div>
                             </div>
                         </div>
