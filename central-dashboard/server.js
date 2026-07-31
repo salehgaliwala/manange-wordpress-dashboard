@@ -931,8 +931,14 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'Invalid parameters. Need "type" and "plugins" if updating plugins.' });
     }
 
-    // Parse skip_backup robustly to handle both string and boolean forms
-    const isSkipBackup = (skip_backup === true || skip_backup === 'true' || skip_backup === 1 || skip_backup === '1');
+    // Parse skip_backup / skipbackup robustly to handle all formats (skip_backup, skipbackup, skipBackup) and types
+    const rawSkipValue = req.body.skip_backup !== undefined
+        ? req.body.skip_backup
+        : (req.body.skipbackup !== undefined
+            ? req.body.skipbackup
+            : req.body.skipBackup);
+
+    const isSkipBackup = (rawSkipValue === true || rawSkipValue === 'true' || rawSkipValue === 1 || rawSkipValue === '1');
 
     // Generate unique Job ID on the dashboard
     const jobId = 'job_dashboard_' + Date.now();
