@@ -919,6 +919,8 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     const { siteId } = req.params;
     const { type, plugins, backup_destination, skip_backup } = req.body;
 
+    console.log(`[Safe Update Trigger] siteId: ${siteId}, type: ${type}, skip_backup input: ${skip_backup} (type: ${typeof skip_backup})`);
+
     const db = loadDB();
     const site = db.sites ? db.sites.find(s => s.id === siteId) : null;
     if (!site) {
@@ -928,6 +930,9 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
     if (!type || (type === 'plugin' && (!plugins || !Array.isArray(plugins)))) {
         return res.status(400).json({ error: 'Invalid parameters. Need "type" and "plugins" if updating plugins.' });
     }
+
+    // Parse skip_backup robustly to handle both string and boolean forms
+    const isSkipBackup = (skip_backup === true || skip_backup === 'true' || skip_backup === 1 || skip_backup === '1');
 
     // Generate unique Job ID on the dashboard
     const jobId = 'job_dashboard_' + Date.now();
@@ -947,12 +952,12 @@ app.post('/api/sites/:siteId/safe-update', requireAuth, async (req, res) => {
         error: null,
         completed: false,
         backup_path: '',
-        skip_backup: !!skip_backup,
+        skip_backup: isSkipBackup,
         updateParams: {
             type,
             plugins,
             backup_destination: destination,
-            skip_backup: !!skip_backup,
+            skip_backup: isSkipBackup,
             siteName: site.name,
             local_backup_path: customLocalPath,
             archive_name: brandedArchiveName
