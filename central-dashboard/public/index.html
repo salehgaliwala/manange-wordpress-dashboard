@@ -597,7 +597,8 @@
                         body: JSON.stringify({
                             type: type,
                             plugins: specifiedPlugins,
-                            backup_destination: backupDest
+                            backup_destination: backupDest,
+                            skip_backup: !takeBackup
                         })
                     });
 

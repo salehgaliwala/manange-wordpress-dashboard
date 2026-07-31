@@ -76,7 +76,7 @@
       "version": "2.1.4",
       "author": "Vault Development Corp",
       "filePath": "/app/central-dashboard/vault/premium-vault-plugin.zip",
-      "uploadedAt": "2026-07-31T06:14:30.963Z"
+      "uploadedAt": "2026-07-31T07:33:47.065Z"
     }
   },
   "jobs": {
@@ -455,6 +455,29 @@
         "siteName": "Local WP Container",
         "local_backup_path": "",
         "archive_name": "Local_WP_Container_backup_2026-07-31_061430_update_1785.zip"
+      },
+      "resumable": true
+    },
+    "job_dashboard_1785483227072": {
+      "id": "job_dashboard_1785483227072",
+      "siteId": "example-wp-site",
+      "status": "broken",
+      "progress": 0,
+      "step": "⚠️ Pipeline failed: ",
+      "error": "",
+      "completed": false,
+      "backup_path": "",
+      "skip_backup": false,
+      "updateParams": {
+        "type": "plugin",
+        "plugins": [
+          "premium-vault-plugin/premium-vault-plugin.php"
+        ],
+        "backup_destination": "s3",
+        "skip_backup": false,
+        "siteName": "Local WP Container",
+        "local_backup_path": "",
+        "archive_name": "Local_WP_Container_backup_2026-07-31_073347_update_1785.zip"
       },
       "resumable": true
     }
